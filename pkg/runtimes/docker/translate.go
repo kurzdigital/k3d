@@ -331,12 +331,43 @@ func TranslateContainerDetailsToNode(containerDetails types.ContainerJSON) (*k3d
 		}
 	}
 
+	// HostConfig.Binds only includes explicit binds; anonymous volumes (auto-
+	// created by Docker for image VOLUME directives, e.g. /var/lib/rancher/k3s
+	// on the k3s image) live in containerDetails.Mounts. We surface them as
+	// pseudo-binds in the form "<volume-name>:<dest>[:<mode>]" so that callers
+	// that recreate a node from its reconstructed spec (NodeReplace via
+	// `node edit` and friends) keep the same persistent state — losing them
+	// silently wipes whatever the image declared as persistent (e.g. etcd data).
+	// Mounts also re-lists every Bind, so dedupe by destination.
+	volumes := append([]string{}, containerDetails.HostConfig.Binds...)
+	bindDests := make(map[string]struct{}, len(volumes))
+	for _, b := range containerDetails.HostConfig.Binds {
+		parts := strings.SplitN(b, ":", 3)
+		if len(parts) >= 2 {
+			bindDests[parts[1]] = struct{}{}
+		}
+	}
+	for _, m := range containerDetails.Mounts {
+		if m.Type != "volume" || m.Name == "" {
+			continue
+		}
+		if _, dup := bindDests[m.Destination]; dup {
+			continue
+		}
+		entry := fmt.Sprintf("%s:%s", m.Name, m.Destination)
+		if m.Mode != "" {
+			entry = fmt.Sprintf("%s:%s", entry, m.Mode)
+		}
+		volumes = append(volumes, entry)
+		bindDests[m.Destination] = struct{}{}
+	}
+
 	node := &k3d.Node{
 		Name:          strings.TrimPrefix(containerDetails.Name, "/"), // container name with leading '/' cut off
 		Role:          k3d.NodeRoles[containerDetails.Config.Labels[k3d.LabelRole]],
 		Image:         containerDetails.Image,
 		K3dEntrypoint: k3dEntrypoint,
-		Volumes:       containerDetails.HostConfig.Binds,
+		Volumes:       volumes,
 		Env:           containerDetails.Config.Env,
 		Cmd:           containerDetails.Config.Cmd,
 		Args:          []string{}, // empty, since Cmd already contains flags
