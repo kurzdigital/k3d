@@ -28,8 +28,11 @@ import (
 	"testing"
 
 	"github.com/go-test/deep"
+	"github.com/stretchr/testify/assert"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/go-connections/nat"
 	k3d "github.com/k3d-io/k3d/v5/pkg/types"
@@ -108,5 +111,104 @@ func TestTranslateNodeToContainer(t *testing.T) {
 
 	if diff := deep.Equal(actualRepresentation, expectedRepresentation); diff != nil {
 		t.Errorf("Actual representation\n%+v\ndoes not match expected representation\n%+v\nDiff:\n%+v", actualRepresentation, expectedRepresentation, diff)
+	}
+}
+
+// TestTranslateContainerDetailsToNodeVolumes covers the volume/mount surfacing
+// logic: explicit binds are kept verbatim, anonymous (named) volumes from
+// containerDetails.Mounts are turned into pseudo-binds, Mounts entries that
+// duplicate a bind destination are dropped, and the optional Mode suffix is
+// appended.
+func TestTranslateContainerDetailsToNodeVolumes(t *testing.T) {
+	testcases := []struct {
+		name     string
+		binds    []string
+		mounts   []container.MountPoint
+		expected []string
+	}{
+		{
+			name:     "only explicit binds, no mounts",
+			binds:    []string{"/host:/tmp/test"},
+			mounts:   nil,
+			expected: []string{"/host:/tmp/test"},
+		},
+		{
+			name:  "anonymous volume surfaced as pseudo-bind",
+			binds: nil,
+			mounts: []container.MountPoint{
+				{Type: mount.TypeVolume, Name: "anon-vol", Destination: "/var/lib/rancher/k3s"},
+			},
+			expected: []string{"anon-vol:/var/lib/rancher/k3s"},
+		},
+		{
+			name:  "anonymous volume with mode suffix",
+			binds: nil,
+			mounts: []container.MountPoint{
+				{Type: mount.TypeVolume, Name: "anon-vol", Destination: "/var/lib/rancher/k3s", Mode: "z"},
+			},
+			expected: []string{"anon-vol:/var/lib/rancher/k3s:z"},
+		},
+		{
+			name:  "mount duplicating a bind destination is deduped",
+			binds: []string{"/host/data:/var/lib/rancher/k3s"},
+			mounts: []container.MountPoint{
+				{Type: mount.TypeVolume, Name: "anon-vol", Destination: "/var/lib/rancher/k3s"},
+			},
+			expected: []string{"/host/data:/var/lib/rancher/k3s"},
+		},
+		{
+			name:  "non-volume mount types are ignored",
+			binds: nil,
+			mounts: []container.MountPoint{
+				{Type: mount.TypeBind, Name: "", Destination: "/somebind"},
+				{Type: mount.TypeTmpfs, Name: "", Destination: "/run"},
+				{Type: mount.TypeVolume, Name: "", Destination: "/no-name"},
+			},
+			expected: []string{},
+		},
+		{
+			name:  "explicit binds kept and anonymous volume appended",
+			binds: []string{"/host:/tmp/test"},
+			mounts: []container.MountPoint{
+				{Type: mount.TypeVolume, Name: "anon-vol", Destination: "/var/lib/rancher/k3s"},
+			},
+			expected: []string{"/host:/tmp/test", "anon-vol:/var/lib/rancher/k3s"},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			details := newMinimalContainerDetails()
+			details.HostConfig.Binds = tc.binds
+			details.Mounts = tc.mounts
+
+			node, err := TranslateContainerDetailsToNode(details)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, node.Volumes)
+		})
+	}
+}
+
+// newMinimalContainerDetails builds a ContainerJSON that passes the default
+// label check in TranslateContainerDetailsToNode and is in a non-running state,
+// so the volume/mount logic can be exercised in isolation without triggering
+// network/IP parsing.
+func newMinimalContainerDetails() dockertypes.ContainerJSON {
+	return dockertypes.ContainerJSON{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			Name: "/k3d-test-server-0",
+			State: &container.State{
+				Running: false,
+				Status:  "exited",
+			},
+			HostConfig: &container.HostConfig{},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{
+				"app":         "k3d",
+				k3d.LabelRole: string(k3d.ServerRole),
+			},
+		},
+		NetworkSettings: &container.NetworkSettings{},
 	}
 }
