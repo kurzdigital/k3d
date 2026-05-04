@@ -1056,7 +1056,26 @@ func NodeReplace(ctx context.Context, runtime runtimes.Runtime, old, new *k3d.No
 
 	// start new node
 	l.Log().Infof("Starting new node %s...", new.Name)
-	if err := NodeStart(ctx, runtime, new, &k3d.NodeStartOpts{Wait: true, NodeHooks: new.HookActions}); err != nil {
+	// Gather environment info so NodeStart's enableFixes hook (DNS magic, etc.)
+	// can resolve HostGateway. Without this, replacing a server/agent with the
+	// DNS fix enabled (the default on Docker via K3D_FIX_DNS) fails immediately
+	// with "Cannot enable DNS fix, as Host Gateway IP is missing!".
+	// We log gather failures at Warn rather than Debug because the very next
+	// step is a NodeStart that will surface a confusing downstream error if
+	// envInfo never made it through.
+	startOpts := &k3d.NodeStartOpts{Wait: true, NodeHooks: new.HookActions}
+	if (new.Role == k3d.ServerRole || new.Role == k3d.AgentRole) && new.RuntimeLabels[k3d.LabelClusterName] != "" {
+		if cluster, err := ClusterGet(ctx, runtime, &k3d.Cluster{Name: new.RuntimeLabels[k3d.LabelClusterName]}); err == nil {
+			if envInfo, err := GatherEnvironmentInfo(ctx, runtime, cluster); err == nil {
+				startOpts.EnvironmentInfo = envInfo
+			} else {
+				l.Log().Warnf("NodeReplace: failed to gather environment info for '%s' (%v) — DNS fix and other env-aware hooks will likely fail when starting the new container", new.Name, err)
+			}
+		} else {
+			l.Log().Warnf("NodeReplace: failed to look up cluster '%s' for env info (%v) — DNS fix and other env-aware hooks will likely fail", new.RuntimeLabels[k3d.LabelClusterName], err)
+		}
+	}
+	if err := NodeStart(ctx, runtime, new, startOpts); err != nil {
 		if err := NodeDelete(ctx, runtime, new, k3d.NodeDeleteOpts{SkipLBUpdate: true}); err != nil {
 			return fmt.Errorf("Failed to start new node. Also failed to rollback: %+v", err)
 		}
