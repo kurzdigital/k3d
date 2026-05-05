@@ -82,3 +82,121 @@ func TestProcessClusterConfig(t *testing.T) {
 	t.Logf("\n===== Resulting Cluster Config (host network) =====\n%+v\n===============\n", clusterCfg)
 	t.Logf("\n===== First Node in Resulting Cluster Config (host network) =====\n%+v\n===============\n", clusterCfg.Cluster.Nodes[0])
 }
+
+func TestApplyAutoGPU(t *testing.T) {
+	supportNone := func() nvidiaSupport { return nvidiaSupport{} }
+	supportCDI := func() nvidiaSupport { return nvidiaSupport{CDI: true, NvidiaRuntime: true} }
+	supportCDIOnly := func() nvidiaSupport { return nvidiaSupport{CDI: true} }
+	supportRuntimeOnly := func() nvidiaSupport { return nvidiaSupport{NvidiaRuntime: true} }
+
+	cases := []struct {
+		name           string
+		autoGPU        string
+		gpuRequest     string // pre-set explicit --gpus
+		devices        []string
+		support        func() nvidiaSupport
+		wantErr        bool
+		wantGPURequest string
+		wantDevices    []string
+	}{
+		{
+			name:           "empty value is a no-op",
+			autoGPU:        "",
+			support:        supportNone,
+			wantGPURequest: "",
+			wantDevices:    nil,
+		},
+		{
+			name:           "explicit none applies nothing",
+			autoGPU:        "none",
+			support:        supportNone,
+			wantGPURequest: "",
+			wantDevices:    nil,
+		},
+		{
+			name:    "invalid vendor errors",
+			autoGPU: "radeon",
+			support: supportNone,
+			wantErr: true,
+		},
+		{
+			name:           "explicit --gpus wins, mapping skipped",
+			autoGPU:        "nvidia",
+			gpuRequest:     "device=0",
+			support:        supportCDI,
+			wantGPURequest: "device=0",
+			wantDevices:    nil,
+		},
+		{
+			name:           "explicit --device wins, mapping skipped",
+			autoGPU:        "nvidia",
+			devices:        []string{"/dev/foo"},
+			support:        supportCDI,
+			wantGPURequest: "",
+			wantDevices:    []string{"/dev/foo"},
+		},
+		{
+			// NVIDIA GPU present, but daemon has neither CDI nor the nvidia
+			// runtime: mapping to --gpus all would fail hard at container
+			// creation, so nothing must be applied.
+			name:           "nvidia without toolkit skips passthrough",
+			autoGPU:        "nvidia",
+			support:        supportNone,
+			wantGPURequest: "",
+			wantDevices:    nil,
+		},
+		{
+			name:           "nvidia with runtime but without CDI uses legacy --gpus all",
+			autoGPU:        "nvidia",
+			support:        supportRuntimeOnly,
+			wantGPURequest: "all",
+			wantDevices:    nil,
+		},
+		{
+			name:           "nvidia with CDI uses device passthrough",
+			autoGPU:        "nvidia",
+			support:        supportCDIOnly,
+			wantGPURequest: "",
+			wantDevices:    []string{"nvidia.com/gpu=all"},
+		},
+		{
+			name:           "intel does not consult nvidia support",
+			autoGPU:        "intel",
+			support:        nil, // would panic if called
+			wantGPURequest: "",
+			wantDevices:    []string{"/dev/dri:/dev/dri:rwm"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := &conf.SimpleConfig{}
+			cfg.Options.Runtime.AutoGPU = c.autoGPU
+			cfg.Options.Runtime.GPURequest = c.gpuRequest
+			cfg.Options.Runtime.Devices = c.devices
+
+			err := applyAutoGPU(cfg, c.support)
+			if c.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, c.wantGPURequest, cfg.Options.Runtime.GPURequest)
+			require.Equal(t, c.wantDevices, cfg.Options.Runtime.Devices)
+		})
+	}
+}
+
+func TestApplyAutoGPUExplicitConfigSkipsDetection(t *testing.T) {
+	// With explicit --gpus set, applyAutoGPU must return before running
+	// ParseVendor (which for "auto" triggers host detection probes) and
+	// before consulting the runtime for NVIDIA support. A nil support
+	// probe would panic if the ordering regressed on the probe side.
+	cfg := &conf.SimpleConfig{}
+	cfg.Options.Runtime.AutoGPU = "auto"
+	cfg.Options.Runtime.GPURequest = "all"
+
+	require.NoError(t, applyAutoGPU(cfg, nil))
+	require.Equal(t, "all", cfg.Options.Runtime.GPURequest)
+	require.Empty(t, cfg.Options.Runtime.Devices)
+}

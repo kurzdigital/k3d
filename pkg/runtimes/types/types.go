@@ -32,6 +32,16 @@ type RuntimeInfo struct {
 	CgroupDriver  string `json:"cgroupdriver,omitempty"`
 	Filesystem    string `json:"filesystem,omitempty"`
 	InfoName      string `json:"infoname,omitempty"`
+	// HasNvidiaCDI reports whether the runtime has discovered an `nvidia.com/gpu`
+	// CDI device. Exposed here so runtime-agnostic callers (e.g. pkg/config) can
+	// decide between CDI and the legacy NVIDIA hook without importing a concrete
+	// runtime implementation.
+	HasNvidiaCDI bool `json:"hasnvidiacdi,omitempty"`
+	// HasNvidiaRuntime reports whether the daemon has an "nvidia" runtime
+	// registered (NVIDIA Container Toolkit), either as a named runtime or as
+	// the daemon default. Used together with HasNvidiaCDI to decide whether
+	// NVIDIA GPU passthrough can work at all.
+	HasNvidiaRuntime bool `json:"hasnvidiaruntime,omitempty"`
 }
 
 type NodeLogsOpts struct {

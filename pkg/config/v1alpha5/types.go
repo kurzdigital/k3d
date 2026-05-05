@@ -118,6 +118,7 @@ type SimpleConfigOptionsRuntime struct {
 	GPURequest    string                 `mapstructure:"gpuRequest" json:"gpuRequest,omitempty"`
 	Devices       []string               `mapstructure:"devices" json:"devices,omitempty"`
 	DockerRuntime string                 `mapstructure:"dockerRuntime" json:"dockerRuntime,omitempty"`
+	AutoGPU       string                 `mapstructure:"autoGpu" json:"autoGpu,omitempty"`
 	ServersMemory string                 `mapstructure:"serversMemory" json:"serversMemory,omitempty"`
 	AgentsMemory  string                 `mapstructure:"agentsMemory" json:"agentsMemory,omitempty"`
 	HostPidMode   bool                   `mapstructure:"hostPidMode" yjson:"hostPidMode,omitempty"`
