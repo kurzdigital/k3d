@@ -247,6 +247,14 @@
                 "type": "string"
               }
             },
+            "dockerRuntime": {
+              "type": "string",
+              "examples": [
+                "nvidia",
+                "crun",
+                "kata"
+              ]
+            },
             "serversMemory": {
               "type": "string"
             },

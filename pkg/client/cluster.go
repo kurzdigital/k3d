@@ -492,6 +492,7 @@ ClusterCreatOpts:
 		node.Restart = true
 		node.GPURequest = clusterCreateOpts.GPURequest
 		node.Devices = clusterCreateOpts.Devices
+		node.DockerRuntime = clusterCreateOpts.DockerRuntime
 
 		// create node
 		l.Log().Infof("Creating node '%s'", node.Name)

@@ -28,8 +28,10 @@ import (
 	"testing"
 
 	"github.com/go-test/deep"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/go-connections/nat"
@@ -219,4 +221,98 @@ func TestTranslateNodeToContainerInvalidDevice(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTranslateNodeToContainerDockerRuntime(t *testing.T) {
+	inputNode := &k3d.Node{
+		Name:          "test",
+		Role:          k3d.ServerRole,
+		Image:         "rancher/k3s:v0.9.0",
+		RuntimeLabels: map[string]string{k3d.LabelRole: string(k3d.ServerRole)},
+		Networks:      []string{"mynet"},
+		DockerRuntime: "nvidia",
+	}
+	inputNode.FillRuntimeLabels()
+
+	repr, err := TranslateNodeToContainer(inputNode)
+	require.NoError(t, err)
+	assert.Equal(t, "nvidia", repr.HostConfig.Runtime, "node.DockerRuntime must propagate to HostConfig.Runtime")
+	assert.Equal(t, "nvidia", repr.ContainerConfig.Labels[k3d.LabelNodeDockerRuntime], "an explicit DockerRuntime must be persisted as a container label")
+}
+
+func TestTranslateNodeToContainerEmptyDockerRuntime(t *testing.T) {
+	inputNode := &k3d.Node{
+		Name:          "test",
+		Role:          k3d.ServerRole,
+		Image:         "rancher/k3s:v0.9.0",
+		RuntimeLabels: map[string]string{k3d.LabelRole: string(k3d.ServerRole)},
+		Networks:      []string{"mynet"},
+	}
+
+	inputNode.FillRuntimeLabels()
+
+	repr, err := TranslateNodeToContainer(inputNode)
+	require.NoError(t, err)
+	// Empty means "use the daemon default", so we must not set Runtime at all.
+	assert.Empty(t, repr.HostConfig.Runtime, "unset DockerRuntime must leave HostConfig.Runtime empty")
+	assert.NotContains(t, repr.ContainerConfig.Labels, k3d.LabelNodeDockerRuntime, "unset DockerRuntime must not create a runtime label")
+}
+
+func TestTranslateContainerDetailsToNodeDockerRuntime(t *testing.T) {
+	// Build a minimal but valid k3d-managed container inspect result.
+	// State.Running=false keeps us out of the IP-parsing branch, which
+	// otherwise needs a real network address.
+	labels := map[string]string{
+		k3d.LabelRole:              string(k3d.ServerRole),
+		k3d.LabelNodeDockerRuntime: "nvidia",
+	}
+	for k, v := range k3d.DefaultRuntimeLabels {
+		labels[k] = v
+	}
+
+	details := types.ContainerJSON{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			Name:  "/test",
+			Image: "rancher/k3s:v0.9.0",
+			State: &container.State{Running: false, Status: "exited"},
+			HostConfig: &container.HostConfig{
+				Runtime: "nvidia", // what the daemon reports for the created container
+			},
+		},
+		Config:          &container.Config{Labels: labels},
+		NetworkSettings: &container.NetworkSettings{},
+	}
+
+	node, err := TranslateContainerDetailsToNode(details)
+	require.NoError(t, err)
+	assert.Equal(t, "nvidia", node.DockerRuntime, "the runtime label must round-trip back to node.DockerRuntime")
+}
+
+func TestTranslateContainerDetailsToNodeDockerRuntimeDaemonDefault(t *testing.T) {
+	// A daemon with default-runtime=nvidia reports the *resolved* runtime in
+	// HostConfig.Runtime even though the user never requested one. Without
+	// the k3d.node.dockerRuntime label, node reconstruction must NOT adopt
+	// that value — otherwise every recreated node would pin the daemon
+	// default explicitly.
+	labels := map[string]string{k3d.LabelRole: string(k3d.ServerRole)}
+	for k, v := range k3d.DefaultRuntimeLabels {
+		labels[k] = v
+	}
+
+	details := types.ContainerJSON{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			Name:  "/test",
+			Image: "rancher/k3s:v0.9.0",
+			State: &container.State{Running: false, Status: "exited"},
+			HostConfig: &container.HostConfig{
+				Runtime: "nvidia", // resolved daemon default, not a user request
+			},
+		},
+		Config:          &container.Config{Labels: labels},
+		NetworkSettings: &container.NetworkSettings{},
+	}
+
+	node, err := TranslateContainerDetailsToNode(details)
+	require.NoError(t, err)
+	assert.Empty(t, node.DockerRuntime, "a daemon-resolved runtime without the runtime label must not be adopted as an explicit DockerRuntime")
 }

@@ -112,6 +112,14 @@ func TranslateNodeToContainer(node *k3d.Node) (*NodeInDocker, error) {
 		hostConfig.DeviceRequests = gpuopts.Value()
 	}
 
+	// --runtime: select a non-default Docker runtime (e.g. "nvidia" for the
+	// classic NVIDIA Container Toolkit, "crun"/"kata" for alternative OCI
+	// runtimes). Empty means "use the daemon's default", which is what the
+	// docker CLI does when --runtime is not passed.
+	if node.DockerRuntime != "" {
+		hostConfig.Runtime = node.DockerRuntime
+	}
+
 	// --device: each spec is either a host device path ('/dev/nvidia0[:/dev/nvidia0[:rwm]]')
 	// or a CDI device ID ('nvidia.com/gpu=all'). Path-style appends to
 	// HostConfig.Devices (DeviceMapping); CDI appends to DeviceRequests with
@@ -392,6 +400,7 @@ func TranslateContainerDetailsToNode(containerDetails types.ContainerJSON) (*k3d
 		Memory:        memoryStr,
 		IP:            nodeIP, // only valid for the cluster network
 		Devices:       devices,
+		DockerRuntime: labels[k3d.LabelNodeDockerRuntime], // NOT HostConfig.Runtime: that reflects the daemon's *resolved* runtime, which would pin the daemon default on recreation (and misreport "nvidia" on default-runtime=nvidia hosts)
 	}
 	return node, nil
 }

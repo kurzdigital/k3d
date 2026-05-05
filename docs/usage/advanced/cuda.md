@@ -7,15 +7,16 @@ If you are using Docker you can install the [NVIDIA Container Toolkit](https://d
 
 ## Choosing how to expose the GPU
 
-k3d offers three flags for getting devices into the node containers. Pick one based on what your host runtime supports:
+k3d offers four flags around GPU and device passthrough. Pick the right one(s) based on what your host runtime supports:
 
 | Flag | When to use | Example |
 |------|-------------|---------|
 | `--gpus` | Legacy NVIDIA Container Toolkit hook (works with the classic `nvidia` Docker runtime). Wires `DeviceRequest` with the NVIDIA driver. | `--gpus all` |
 | `--device <CDI ID>` | Modern, Docker-native. Requires Docker 25+ and `nvidia-container-toolkit` configured in CDI mode (`/etc/cdi/*.yaml`). | `--device nvidia.com/gpu=all` |
 | `--device <path>` | Anything else: AMD ROCm (`/dev/kfd`, `/dev/dri`), Intel iGPU, FPGAs, FUSE, `/dev/kvm`, ... Plain host device passthrough. | `--device /dev/kfd --device /dev/dri:/dev/dri:rwm` |
+| `--runtime` | Use a non-default Docker runtime for the node containers. Required for the classic `nvidia` runtime if you need it to inject Vulkan ICD files (`/etc/vulkan/icd.d`) and libraries — neither `--gpus` nor `--device` does that. Also useful for `crun`, `kata`, etc. | `--runtime nvidia` |
 
-`--gpus` and `--device` are additive — you can combine them, e.g. when you want CDI plus a non-GPU `/dev/...` node. The rest of this page focuses on the legacy `--gpus` path because that is what the custom CUDA image below depends on.
+The flags are additive: `--gpus`, `--device`, and `--runtime` can be combined. A typical Vulkan-on-NVIDIA setup is `--runtime nvidia --gpus all`. The rest of this page focuses on the legacy `--gpus` path because that is what the custom CUDA image below depends on.
 
 ## Building a customized K3s image
 

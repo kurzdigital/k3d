@@ -97,6 +97,7 @@ const (
 	LabelRegistryPortExternal    string = "k3s.registry.port.external"
 	LabelRegistryPortInternal    string = "k3s.registry.port.internal"
 	LabelNodeStaticIP            string = "k3d.node.staticIP"
+	LabelNodeDockerRuntime       string = "k3d.node.dockerRuntime"
 )
 
 // DoNotCopyServerFlags defines a list of commands/args that shouldn't be copied from an existing node when adding a similar node to a cluster
@@ -117,6 +118,7 @@ type ClusterCreateOpts struct {
 	DisableLoadBalancer bool              `json:"disableLoadbalancer,omitempty"`
 	GPURequest          string            `json:"gpuRequest,omitempty"`
 	Devices             []string          `json:"devices,omitempty"`
+	DockerRuntime       string            `json:"dockerRuntime,omitempty"`
 	ServersMemory       string            `json:"serversMemory,omitempty"`
 	AgentsMemory        string            `json:"agentsMemory,omitempty"`
 	NodeHooks           []NodeHook        `json:"nodeHooks,omitempty"`
@@ -306,6 +308,7 @@ type Node struct {
 	AgentOpts      AgentOpts             `json:"agentOpts,omitempty"`
 	GPURequest     string                // filled automatically
 	Devices        []string              // filled automatically — Docker --device specs (path or CDI)
+	DockerRuntime  string                // filled automatically — Docker --runtime selector (e.g. "nvidia", "crun")
 	Memory         string                // filled automatically
 	State          NodeState             // filled automatically
 	IP             NodeIP                // filled automatically -> refers solely to the cluster network

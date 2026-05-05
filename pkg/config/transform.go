@@ -295,6 +295,7 @@ func TransformSimpleToClusterConfig(ctx context.Context, runtime runtimes.Runtim
 		DisableLoadBalancer: simpleConfig.Options.K3dOptions.DisableLoadbalancer,
 		GPURequest:          simpleConfig.Options.Runtime.GPURequest,
 		Devices:             simpleConfig.Options.Runtime.Devices,
+		DockerRuntime:       simpleConfig.Options.Runtime.DockerRuntime,
 		ServersMemory:       simpleConfig.Options.Runtime.ServersMemory,
 		AgentsMemory:        simpleConfig.Options.Runtime.AgentsMemory,
 		HostAliases:         simpleConfig.HostAliases,
