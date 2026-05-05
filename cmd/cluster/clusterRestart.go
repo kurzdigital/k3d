@@ -47,12 +47,16 @@ func NewCmdClusterRestart() *cobra.Command {
 
 Stops every node in parallel and starts them again, re-running the
 cluster-level post-start phase: HostAliases injection into /etc/hosts
-and CoreDNS configmap rebuild. Use this after host-side changes — new
-network gateway after a WLAN switch, Docker daemon restart, network
-recreate.
+and CoreDNS configmap rebuild.
 
-For graceful pod cycling without recreating cluster state, see
-` + "`cluster rollout`" + `.`,
+Other tools serve nearby use-cases more surgically:
+  - ` + "`cluster rollout`" + `              graceful per-node restart (pod cycling).
+  - ` + "`cluster update-environment`" + `   refresh the cluster's view of the host
+                                  (gateway IP, network members) without
+                                  restarting any container.
+
+Use ` + "`cluster restart`" + ` when you want both: stop everything, refresh
+environment state, start everything again.`,
 		ValidArgsFunction: util.ValidArgsAvailableClusters,
 		Run: func(cmd *cobra.Command, args []string) {
 			clusters := parseRestartClusterCmd(cmd, args)
