@@ -144,6 +144,7 @@ options:
       - "/dev/kfd"                  # AMD ROCm compute device
       - "/dev/dri:/dev/dri:rwm"     # AMD/Intel render nodes (host:container[:perms])
       - "nvidia.com/gpu=all"        # CDI device ID (Docker 25+ with nvidia-container-toolkit in CDI mode)
+    dockerRuntime: nvidia # same as `--runtime nvidia`; selects a non-default Docker runtime (e.g. for Vulkan ICD passthrough)
     labels:
       - label: bar=baz # same as `--runtime-label 'bar=baz@agent:1'` -> this results in a runtime (docker) container label
         nodeFilters:

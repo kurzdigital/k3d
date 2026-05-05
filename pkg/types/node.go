@@ -36,4 +36,11 @@ func (node *Node) FillRuntimeLabels() {
 	}
 	// second most important: the node role label
 	node.RuntimeLabels[LabelRole] = string(node.Role)
+	// persist an explicitly requested Docker runtime, so that node
+	// reconstruction can distinguish it from the daemon's default runtime
+	// (containerDetails.HostConfig.Runtime always shows the resolved
+	// runtime, even if it was never requested explicitly)
+	if node.DockerRuntime != "" {
+		node.RuntimeLabels[LabelNodeDockerRuntime] = node.DockerRuntime
+	}
 }

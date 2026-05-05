@@ -16,6 +16,7 @@ k3d
       -e, --env  # add environment variables to the nodes (quoted string, format: 'KEY[=VALUE][@NODEFILTER[;NODEFILTER...]]', use flag multiple times)
       --gpus  # [from docker CLI] add GPU devices to the node containers (string, e.g. 'all') -- legacy NVIDIA Container Toolkit hook
       --device  # [from docker CLI] expose a host device or CDI device ID to every node container (string, e.g. '/dev/kfd', '/dev/dri:/dev/dri:rwm', 'nvidia.com/gpu=all', use flag multiple times)
+      --runtime  # [from docker CLI] select a non-default Docker runtime for the node containers (string, e.g. 'nvidia', 'crun', 'kata')
       -i, --image  # specify which k3s image should be used for the nodes (string, default: 'docker.io/rancher/k3s:v1.20.0-k3s2', tag changes per build)
       --k3s-arg  # add additional arguments to the k3s server/agent (quoted string, use flag multiple times) (see https://rancher.com/docs/k3s/latest/en/installation/install-options/server-config/#k3s-server-cli-help & https://rancher.com/docs/k3s/latest/en/installation/install-options/agent-config/#k3s-agent-cli-help)
       --kubeconfig-switch-context  # (implies --kubeconfig-update-default) automatically sets the current-context of your default kubeconfig to the new cluster's context (default: true)

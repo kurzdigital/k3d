@@ -180,3 +180,14 @@ k3d cluster create --registry-use mycluster-registry mycluster
 !!! note "Missing cpuset cgroup controller"
     If you experince an error regarding missing cpuset cgroup controller, ensure the user unit `xdg-document-portal.service` is disabled by running `systemctl --user stop xdg-document-portal.service`. See [this issue](https://github.com/systemd/systemd/issues/18293#issuecomment-831397578)
 
+## GPU and device passthrough
+
+`--device <path>` works on Podman the same way it does on Docker — paths under `/dev/...` are exposed via the standard Docker compat API. Use this for AMD ROCm (`/dev/kfd`, `/dev/dri`), Intel iGPU, FUSE, `/dev/kvm`, etc.
+
+For NVIDIA GPUs on Podman, prefer **CDI**: `--device nvidia.com/gpu=all`. Configure `nvidia-ctk` for CDI mode and Podman picks the device specs up natively.
+
+Two flags are Docker-leaning and may not behave the same way on Podman:
+
+- `--gpus` produces `HostConfig.DeviceRequests` with the legacy NVIDIA driver hint. Podman recognises this only via its compat layer and only for some versions; CDI via `--device` is the recommended path.
+- `--runtime` selects a per-container Docker runtime (e.g. `nvidia`, `crun`, `kata`) and has no direct Podman equivalent — Podman's OCI runtime is configured globally on the daemon. On Podman, leave `--runtime` unset and use CDI via `--device` instead.
+

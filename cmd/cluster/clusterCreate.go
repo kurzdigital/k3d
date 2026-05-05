@@ -318,6 +318,9 @@ func NewCmdClusterCreate() *cobra.Command {
 	cmd.Flags().StringArray("device", nil, "Expose a host device or CDI device ID to every node container. Path-style ('/dev/HOST[:/dev/CONTAINER[:rwm]]', e.g. '/dev/kfd', '/dev/dri') or CDI-style ('vendor.com/class=name', e.g. 'nvidia.com/gpu=all'). Use multiple times for multiple devices. [From docker]")
 	_ = cfgViper.BindPFlag("options.runtime.devices", cmd.Flags().Lookup("device"))
 
+	cmd.Flags().String("runtime", "", "Select a non-default Docker runtime for the node containers (e.g. 'nvidia' for the classic NVIDIA Container Toolkit hook, exposing Vulkan ICDs and libraries). Defaults to the docker daemon's default runtime. [From docker]")
+	_ = cfgViper.BindPFlag("options.runtime.dockerruntime", cmd.Flags().Lookup("runtime"))
+
 	cmd.Flags().String("servers-memory", "", "Memory limit imposed on the server nodes [From docker]")
 	_ = cfgViper.BindPFlag("options.runtime.serversmemory", cmd.Flags().Lookup("servers-memory"))
 
