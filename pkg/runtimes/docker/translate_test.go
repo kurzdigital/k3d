@@ -29,6 +29,7 @@ import (
 
 	"github.com/go-test/deep"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -114,6 +115,115 @@ func TestTranslateNodeToContainer(t *testing.T) {
 	}
 }
 
+func TestParsePathDeviceMapping(t *testing.T) {
+	cases := []struct {
+		spec    string
+		want    container.DeviceMapping
+		isPath  bool
+		wantErr bool
+	}{
+		{
+			spec:   "/dev/nvidia0",
+			want:   container.DeviceMapping{PathOnHost: "/dev/nvidia0", PathInContainer: "/dev/nvidia0", CgroupPermissions: "rwm"},
+			isPath: true,
+		},
+		{
+			spec:   "/dev/nvidia0:/dev/nvidia0",
+			want:   container.DeviceMapping{PathOnHost: "/dev/nvidia0", PathInContainer: "/dev/nvidia0", CgroupPermissions: "rwm"},
+			isPath: true,
+		},
+		{
+			spec:   "/dev/nvidia0:/dev/foo",
+			want:   container.DeviceMapping{PathOnHost: "/dev/nvidia0", PathInContainer: "/dev/foo", CgroupPermissions: "rwm"},
+			isPath: true,
+		},
+		{
+			spec:   "/dev/nvidia0:/dev/foo:r",
+			want:   container.DeviceMapping{PathOnHost: "/dev/nvidia0", PathInContainer: "/dev/foo", CgroupPermissions: "r"},
+			isPath: true,
+		},
+		// Empty container path falls back to host path.
+		{
+			spec:   "/dev/kvm::rw",
+			want:   container.DeviceMapping{PathOnHost: "/dev/kvm", PathInContainer: "/dev/kvm", CgroupPermissions: "rw"},
+			isPath: true,
+		},
+		// CDI specs are not paths and must be rejected here for the caller
+		// to route them to DeviceRequests.
+		{spec: "nvidia.com/gpu=all", isPath: false},
+		{spec: "vendor.example/foo=bar", isPath: false},
+		// Garbage that's not a path: also not a path.
+		{spec: "all", isPath: false},
+		{spec: "", isPath: false},
+		// Malformed cgroup permissions must be rejected client-side
+		// (docker CLI behaviour) instead of surfacing a daemon error.
+		{spec: "/dev/nvidia0:/dev/nvidia0:rx", isPath: true, wantErr: true},
+		{spec: "/dev/nvidia0:/dev/nvidia0:rr", isPath: true, wantErr: true},
+		{spec: "/dev/nvidia0:/dev/nvidia0:rwx", isPath: true, wantErr: true},
+	}
+
+	for _, c := range cases {
+		got, isPath, err := parsePathDeviceMapping(c.spec)
+		if isPath != c.isPath {
+			t.Errorf("spec %q: isPath = %v, want %v", c.spec, isPath, c.isPath)
+			continue
+		}
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("spec %q: expected an error, got none", c.spec)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("spec %q: unexpected error: %v", c.spec, err)
+			continue
+		}
+		if !c.isPath {
+			continue
+		}
+		if got != c.want {
+			t.Errorf("spec %q: got %+v, want %+v", c.spec, got, c.want)
+		}
+	}
+}
+
+func TestTranslateNodeToContainerInvalidDevice(t *testing.T) {
+	cases := []struct {
+		name    string
+		device  string
+		wantErr bool
+	}{
+		{name: "valid host path", device: "/dev/nvidia0", wantErr: false},
+		{name: "valid CDI spec", device: "nvidia.com/gpu=all", wantErr: false},
+		// Neither a path nor a well-formed CDI ID -> must be rejected.
+		{name: "garbage", device: "all", wantErr: true},
+		{name: "missing equals", device: "nvidia.com/gpu", wantErr: true},
+		{name: "missing slash", device: "gpu=all", wantErr: true},
+		// Path-style spec with bad cgroup permissions -> rejected client-side.
+		{name: "invalid cgroup permissions", device: "/dev/nvidia0:/dev/nvidia0:rx", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			inputNode := &k3d.Node{
+				Name:          "test",
+				Role:          k3d.ServerRole,
+				Image:         "rancher/k3s:v0.9.0",
+				RuntimeLabels: map[string]string{k3d.LabelRole: string(k3d.ServerRole)},
+				Networks:      []string{"mynet"},
+				Devices:       []string{c.device},
+			}
+
+			_, err := TranslateNodeToContainer(inputNode)
+			if c.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 // TestTranslateContainerDetailsToNodeVolumes covers the volume/mount surfacing
 // logic: explicit binds are kept verbatim, anonymous (named) volumes from
 // containerDetails.Mounts are turned into pseudo-binds, Mounts entries that
@@ -188,6 +298,11 @@ func TestTranslateContainerDetailsToNodeVolumes(t *testing.T) {
 		})
 	}
 }
+
+// newMinimalContainerDetails builds a ContainerJSON that passes the default
+// label check in TranslateContainerDetailsToNode and is in a non-running state,
+// so the volume/mount logic can be exercised in isolation without triggering
+// network/IP parsing.
 
 // newMinimalContainerDetails builds a ContainerJSON that passes the default
 // label check in TranslateContainerDetailsToNode and is in a non-running state,

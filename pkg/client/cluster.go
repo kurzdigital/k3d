@@ -491,6 +491,7 @@ ClusterCreatOpts:
 		node.Networks = []string{cluster.Network.Name}
 		node.Restart = true
 		node.GPURequest = clusterCreateOpts.GPURequest
+		node.Devices = clusterCreateOpts.Devices
 
 		// create node
 		l.Log().Infof("Creating node '%s'", node.Name)

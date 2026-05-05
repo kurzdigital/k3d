@@ -139,7 +139,11 @@ options:
     updateDefaultKubeconfig: true # add new cluster to your default Kubeconfig; same as `--kubeconfig-update-default` (default: true)
     switchCurrentContext: true # also set current-context to the new cluster's context; same as `--kubeconfig-switch-context` (default: true)
   runtime: # runtime (docker) specific options
-    gpuRequest: all # same as `--gpus all`
+    gpuRequest: all # same as `--gpus all` (legacy NVIDIA Container Toolkit hook)
+    devices: # same as repeated `--device` flags; path-style or CDI device IDs
+      - "/dev/kfd"                  # AMD ROCm compute device
+      - "/dev/dri:/dev/dri:rwm"     # AMD/Intel render nodes (host:container[:perms])
+      - "nvidia.com/gpu=all"        # CDI device ID (Docker 25+ with nvidia-container-toolkit in CDI mode)
     labels:
       - label: bar=baz # same as `--runtime-label 'bar=baz@agent:1'` -> this results in a runtime (docker) container label
         nodeFilters:

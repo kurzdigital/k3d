@@ -241,6 +241,12 @@
             "gpuRequest": {
               "type": "string"
             },
+            "devices": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "serversMemory": {
               "type": "string"
             },
