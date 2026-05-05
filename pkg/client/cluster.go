@@ -1044,114 +1044,161 @@ func ClusterStart(ctx context.Context, runtime k3drt.Runtime, cluster *k3d.Clust
 	 */
 
 	if len(servers) > 0 || len(agents) > 0 { // TODO: make checks for required cluster start actions cleaner
-		postStartErrgrp, postStartErrgrpCtx := errgroup.WithContext(ctx)
-
-		/*** DNS ***/
-
-		// -> skip if hostnetwork mode
-		if cluster.Network.Name == "host" {
-			l.Log().Debugf("Not injecting hostAliases into /etc/hosts and CoreDNS as clusternetwork is 'host'")
-		} else {
-			// -> add hostAliases to /etc/hosts in all nodes
-			// --> inject host-gateway as host.k3d.internal
-			clusterStartOpts.HostAliases = append(clusterStartOpts.HostAliases, k3d.HostAlias{
-				IP:        clusterStartOpts.EnvironmentInfo.HostGateway.String(),
-				Hostnames: []string{"host.k3d.internal"},
-			})
-
-			for _, node := range append(servers, agents...) {
-				currNode := node
-				postStartErrgrp.Go(func() error {
-					return NewHostAliasesInjectEtcHostsAction(runtime, clusterStartOpts.HostAliases).Run(postStartErrgrpCtx, currNode)
-				})
-			}
-
-			// -> inject hostAliases and network members into CoreDNS configmap
-			if len(servers) > 0 {
-				postStartErrgrp.Go(func() error {
-					hosts := ""
-
-					// hosts: hostAliases (including host.k3d.internal)
-					for _, hostAlias := range clusterStartOpts.HostAliases {
-						hosts += fmt.Sprintf("%s %s\n", hostAlias.IP, strings.Join(hostAlias.Hostnames, " "))
-					}
-
-					// more hosts: network members ("neighbor" containers)
-					net, err := runtime.GetNetwork(postStartErrgrpCtx, &cluster.Network)
-					if err != nil {
-						return fmt.Errorf("failed to get cluster network %s to inject host records into CoreDNS: %w", cluster.Network.Name, err)
-					}
-					for _, member := range net.Members {
-						hosts += fmt.Sprintf("%s %s\n", member.IP.String(), member.Name)
-					}
-
-					// inject CoreDNS configmap
-					l.Log().Infof("Injecting records for hostAliases (incl. host.k3d.internal) and for %d network members into CoreDNS configmap...", len(net.Members))
-					act := actions.RewriteFileAction{
-						Runtime: runtime,
-						Path:    "/var/lib/rancher/k3s/server/manifests/coredns.yaml",
-						Mode:    0744,
-						RewriteFunc: func(input []byte) ([]byte, error) {
-							split, err := util.SplitYAML(input)
-							if err != nil {
-								return nil, fmt.Errorf("error splitting yaml: %w", err)
-							}
-
-							var outputBuf bytes.Buffer
-							outputEncoder := util.NewYAMLEncoder(&outputBuf)
-
-							for _, d := range split {
-								var doc map[string]interface{}
-								if err := yaml.Unmarshal(d, &doc); err != nil {
-									return nil, err
-								}
-								if kind, ok := doc["kind"]; ok {
-									if strings.ToLower(kind.(string)) == "configmap" {
-										configmapData, ok := doc["data"].(map[string]interface{})
-										if !ok {
-											return nil, fmt.Errorf("invalid ConfigMap data type: %T", doc["data"])
-										}
-										configmapData["NodeHosts"] = hosts
-									}
-								}
-								if err := outputEncoder.Encode(doc); err != nil {
-									return nil, err
-								}
-							}
-							_ = outputEncoder.Close()
-							return outputBuf.Bytes(), nil
-						},
-					}
-
-					// get the first server in the list and run action on it once it's ready for it
-					for _, n := range servers {
-						// do not try to run the action, if CoreDNS is disabled on K3s level
-						for _, flag := range n.Args {
-							if strings.HasPrefix(flag, "--disable") && strings.Contains(flag, "coredns") {
-								l.Log().Debugf("CoreDNS disabled in K3s via flag `%s`. Not trying to use it.", flag)
-								return nil
-							}
-						}
-						ts, err := time.Parse("2006-01-02T15:04:05.999999999Z", n.State.Started)
-						if err != nil {
-							return err
-						}
-						if err := NodeWaitForLogMessage(postStartErrgrpCtx, runtime, n, "Cluster dns configmap", ts.Truncate(time.Second)); err != nil {
-							return err
-						}
-						return act.Run(postStartErrgrpCtx, n) // nolint:staticcheck // FIXME: Does this loop really only concern the first server? (SA4004: the surrounding loop is unconditionally terminated (staticcheck))
-					}
-					return nil
-				})
-			}
-		}
-
-		if err := postStartErrgrp.Wait(); err != nil {
+		if err := applyClusterEnvironment(ctx, runtime, cluster, clusterStartOpts.EnvironmentInfo, clusterStartOpts.HostAliases, servers, agents); err != nil {
 			return fmt.Errorf("error during post-start cluster preparation: %w", err)
 		}
 	}
 
 	return nil
+}
+
+// applyClusterEnvironment runs the cluster-level post-start phase:
+// inject host aliases into /etc/hosts of every running server/agent
+// (including the auto-managed `host.k3d.internal` entry pointing at the
+// current host gateway), and rewrite the CoreDNS configmap so cluster
+// DNS resolves both the host-aliases and every container in the cluster
+// network. Idempotent — safe to call multiple times against a running
+// cluster (e.g. from `cluster update-environment` after a host network
+// change).
+//
+// extraHostAliases is the user-provided HostAlias slice (typically from
+// the cluster config). It is NOT mutated; this function appends
+// host.k3d.internal to a local copy.
+//
+// Skipped entirely if the cluster runs in `host` network mode (no
+// per-node /etc/hosts to manage; CoreDNS uses the host's resolver).
+func applyClusterEnvironment(
+	ctx context.Context,
+	runtime k3drt.Runtime,
+	cluster *k3d.Cluster,
+	envInfo *k3d.EnvironmentInfo,
+	extraHostAliases []k3d.HostAlias,
+	servers []*k3d.Node,
+	agents []*k3d.Node,
+) error {
+	if cluster.Network.Name == "host" {
+		l.Log().Debugf("Not injecting hostAliases into /etc/hosts and CoreDNS as clusternetwork is 'host'")
+		return nil
+	}
+
+	// Combine user-provided aliases with the auto-managed host-gateway
+	// entry. Build a fresh slice so we never mutate the caller's
+	// (clusterStartOpts.HostAliases would be re-mutated on every cluster
+	// start otherwise).
+	hostAliases := make([]k3d.HostAlias, 0, len(extraHostAliases)+1)
+	hostAliases = append(hostAliases, extraHostAliases...)
+	hostAliases = append(hostAliases, k3d.HostAlias{
+		IP:        envInfo.HostGateway.String(),
+		Hostnames: []string{"host.k3d.internal"},
+	})
+
+	postStartErrgrp, postStartErrgrpCtx := errgroup.WithContext(ctx)
+
+	// Inject host-aliases into /etc/hosts on every server+agent, in parallel.
+	for _, node := range append(servers, agents...) {
+		currNode := node
+		postStartErrgrp.Go(func() error {
+			return NewHostAliasesInjectEtcHostsAction(runtime, hostAliases).Run(postStartErrgrpCtx, currNode)
+		})
+	}
+
+	// Rewrite CoreDNS configmap once (only needs to happen on a single
+	// server — k3s applies the manifest cluster-wide).
+	if len(servers) > 0 {
+		postStartErrgrp.Go(func() error {
+			hosts := ""
+
+			// hosts: hostAliases (including host.k3d.internal)
+			for _, hostAlias := range hostAliases {
+				hosts += fmt.Sprintf("%s %s\n", hostAlias.IP, strings.Join(hostAlias.Hostnames, " "))
+			}
+
+			// more hosts: network members ("neighbor" containers)
+			net, err := runtime.GetNetwork(postStartErrgrpCtx, &cluster.Network)
+			if err != nil {
+				return fmt.Errorf("failed to get cluster network %s to inject host records into CoreDNS: %w", cluster.Network.Name, err)
+			}
+			for _, member := range net.Members {
+				hosts += fmt.Sprintf("%s %s\n", member.IP.String(), member.Name)
+			}
+
+			// inject CoreDNS configmap
+			l.Log().Infof("Injecting records for hostAliases (incl. host.k3d.internal) and for %d network members into CoreDNS configmap...", len(net.Members))
+			act := actions.RewriteFileAction{
+				Runtime: runtime,
+				Path:    "/var/lib/rancher/k3s/server/manifests/coredns.yaml",
+				Mode:    0744,
+				RewriteFunc: func(input []byte) ([]byte, error) {
+					split, err := util.SplitYAML(input)
+					if err != nil {
+						return nil, fmt.Errorf("error splitting yaml: %w", err)
+					}
+
+					var outputBuf bytes.Buffer
+					outputEncoder := util.NewYAMLEncoder(&outputBuf)
+
+					for _, d := range split {
+						var doc map[string]interface{}
+						if err := yaml.Unmarshal(d, &doc); err != nil {
+							return nil, err
+						}
+						if kind, ok := doc["kind"]; ok {
+							if strings.ToLower(kind.(string)) == "configmap" {
+								configmapData, ok := doc["data"].(map[string]interface{})
+								if !ok {
+									return nil, fmt.Errorf("invalid ConfigMap data type: %T", doc["data"])
+								}
+								configmapData["NodeHosts"] = hosts
+							}
+						}
+						if err := outputEncoder.Encode(doc); err != nil {
+							return nil, err
+						}
+					}
+					_ = outputEncoder.Close()
+					return outputBuf.Bytes(), nil
+				},
+			}
+
+			// get the first server in the list and run action on it once it's ready for it
+			for _, n := range servers {
+				// do not try to run the action, if CoreDNS is disabled on K3s level
+				for _, flag := range n.Args {
+					if strings.HasPrefix(flag, "--disable") && strings.Contains(flag, "coredns") {
+						l.Log().Debugf("CoreDNS disabled in K3s via flag `%s`. Not trying to use it.", flag)
+						return nil
+					}
+				}
+				// State.Started carries the container's StartedAt from
+				// docker inspect, so it's populated whenever the container
+				// has ever been started — both on the ClusterStart path
+				// (just-started, ts ~now) and on the ClusterUpdateEnvironment
+				// path (running for an unknown length of time, ts could be
+				// hours/days old). NodeWaitForLogMessage filters from `ts`
+				// forward, so in the update-environment case the
+				// `Cluster dns configmap` line is already in the log
+				// history and the wait returns immediately. Guarding on
+				// `!= ""` is a defensive bypass for the (currently
+				// unreachable) case where the container has never been
+				// started, e.g. a Cluster value built from config without
+				// hitting the runtime — we'd otherwise fail time.Parse on
+				// an empty string.
+				if n.State.Started != "" {
+					ts, err := time.Parse("2006-01-02T15:04:05.999999999Z", n.State.Started)
+					if err != nil {
+						return err
+					}
+					if err := NodeWaitForLogMessage(postStartErrgrpCtx, runtime, n, "Cluster dns configmap", ts.Truncate(time.Second)); err != nil {
+						return err
+					}
+				}
+				return act.Run(postStartErrgrpCtx, n) // nolint:staticcheck // FIXME: Does this loop really only concern the first server? (SA4004: the surrounding loop is unconditionally terminated (staticcheck))
+			}
+			return nil
+		})
+	}
+
+	return postStartErrgrp.Wait()
 }
 
 // ClusterStop stops a whole cluster (i.e. all nodes of the cluster)
