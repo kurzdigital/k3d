@@ -116,6 +116,7 @@ type ClusterCreateOpts struct {
 	Timeout             time.Duration     `json:"timeout,omitempty"`
 	DisableLoadBalancer bool              `json:"disableLoadbalancer,omitempty"`
 	GPURequest          string            `json:"gpuRequest,omitempty"`
+	Devices             []string          `json:"devices,omitempty"`
 	ServersMemory       string            `json:"serversMemory,omitempty"`
 	AgentsMemory        string            `json:"agentsMemory,omitempty"`
 	NodeHooks           []NodeHook        `json:"nodeHooks,omitempty"`
@@ -304,6 +305,7 @@ type Node struct {
 	ServerOpts     ServerOpts            `json:"serverOpts,omitempty"`
 	AgentOpts      AgentOpts             `json:"agentOpts,omitempty"`
 	GPURequest     string                // filled automatically
+	Devices        []string              // filled automatically — Docker --device specs (path or CDI)
 	Memory         string                // filled automatically
 	State          NodeState             // filled automatically
 	IP             NodeIP                // filled automatically -> refers solely to the cluster network

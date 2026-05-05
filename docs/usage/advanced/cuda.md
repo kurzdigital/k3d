@@ -5,6 +5,18 @@ CUDA workloads require the NVIDIA Container Runtime, so containerd needs to be c
 The K3s container itself also needs to run with this runtime.  
 If you are using Docker you can install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
 
+## Choosing how to expose the GPU
+
+k3d offers three flags for getting devices into the node containers. Pick one based on what your host runtime supports:
+
+| Flag | When to use | Example |
+|------|-------------|---------|
+| `--gpus` | Legacy NVIDIA Container Toolkit hook (works with the classic `nvidia` Docker runtime). Wires `DeviceRequest` with the NVIDIA driver. | `--gpus all` |
+| `--device <CDI ID>` | Modern, Docker-native. Requires Docker 25+ and `nvidia-container-toolkit` configured in CDI mode (`/etc/cdi/*.yaml`). | `--device nvidia.com/gpu=all` |
+| `--device <path>` | Anything else: AMD ROCm (`/dev/kfd`, `/dev/dri`), Intel iGPU, FPGAs, FUSE, `/dev/kvm`, ... Plain host device passthrough. | `--device /dev/kfd --device /dev/dri:/dev/dri:rwm` |
+
+`--gpus` and `--device` are additive — you can combine them, e.g. when you want CDI plus a non-GPU `/dev/...` node. The rest of this page focuses on the legacy `--gpus` path because that is what the custom CUDA image below depends on.
+
 ## Building a customized K3s image
 
 To get the NVIDIA container runtime in the K3s image you need to build your own K3s image.  

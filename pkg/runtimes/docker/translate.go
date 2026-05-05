@@ -112,6 +112,33 @@ func TranslateNodeToContainer(node *k3d.Node) (*NodeInDocker, error) {
 		hostConfig.DeviceRequests = gpuopts.Value()
 	}
 
+	// --device: each spec is either a host device path ('/dev/nvidia0[:/dev/nvidia0[:rwm]]')
+	// or a CDI device ID ('nvidia.com/gpu=all'). Path-style appends to
+	// HostConfig.Devices (DeviceMapping); CDI appends to DeviceRequests with
+	// Driver="cdi".
+	for _, spec := range node.Devices {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+		if mapping, isPath, err := parsePathDeviceMapping(spec); isPath {
+			if err != nil {
+				return nil, err
+			}
+			hostConfig.Devices = append(hostConfig.Devices, mapping)
+			continue
+		}
+		// Anything not starting with '/' is treated as a CDI device ID.
+		// Validate shape: <vendor>/<class>=<name>.
+		if !strings.Contains(spec, "=") || !strings.Contains(spec, "/") {
+			return nil, fmt.Errorf("invalid --device spec %q: expected a host path ('/dev/...') or a CDI device ID ('<vendor>/<class>=<name>')", spec)
+		}
+		hostConfig.DeviceRequests = append(hostConfig.DeviceRequests, docker.DeviceRequest{
+			Driver:    "cdi",
+			DeviceIDs: []string{spec},
+		})
+	}
+
 	// memory limits
 	// fake meminfo is mounted to hostConfig.Binds
 	if node.Memory != "" {
@@ -320,6 +347,32 @@ func TranslateContainerDetailsToNode(containerDetails types.ContainerJSON) (*k3d
 		l.Log().Debugf("failed to get IP for container %s as we couldn't find the cluster network", containerDetails.Name)
 	}
 
+	// Re-derive --device specs from the container's runtime config so a
+	// later NodeReplace recreates the same device mappings. Path-style
+	// devices come from HostConfig.Devices; CDI-driver requests come from
+	// HostConfig.DeviceRequests with Driver=="cdi". The legacy `--gpus`
+	// path (Driver==""/"nvidia" etc.) is intentionally NOT round-tripped
+	// here — that field is owned by node.GPURequest, not by node.Devices.
+	var devices []string
+	for _, d := range containerDetails.HostConfig.Devices {
+		spec := d.PathOnHost
+		if d.PathInContainer != "" && d.PathInContainer != d.PathOnHost {
+			spec = fmt.Sprintf("%s:%s", spec, d.PathInContainer)
+		}
+		if d.CgroupPermissions != "" && d.CgroupPermissions != "rwm" {
+			if !strings.Contains(spec, ":") {
+				spec = fmt.Sprintf("%s:%s", spec, d.PathOnHost)
+			}
+			spec = fmt.Sprintf("%s:%s", spec, d.CgroupPermissions)
+		}
+		devices = append(devices, spec)
+	}
+	for _, dr := range containerDetails.HostConfig.DeviceRequests {
+		if dr.Driver == "cdi" {
+			devices = append(devices, dr.DeviceIDs...)
+		}
+	}
+
 	node := &k3d.Node{
 		Name:          strings.TrimPrefix(containerDetails.Name, "/"), // container name with leading '/' cut off
 		Role:          k3d.NodeRoles[containerDetails.Config.Labels[k3d.LabelRole]],
@@ -338,6 +391,51 @@ func TranslateContainerDetailsToNode(containerDetails types.ContainerJSON) (*k3d
 		State:         nodeState,
 		Memory:        memoryStr,
 		IP:            nodeIP, // only valid for the cluster network
+		Devices:       devices,
 	}
 	return node, nil
+}
+
+// parsePathDeviceMapping parses a Docker-style path device spec into a
+// DeviceMapping. Returns (mapping, true, nil) if the spec looks like a
+// host path; (zero, false, nil) otherwise (caller should try CDI). A
+// path-style spec with malformed cgroup permissions yields
+// (zero, true, err).
+//
+// Accepted forms:
+//
+//	/dev/X                    → host = container = /dev/X, perms "rwm"
+//	/dev/X:/dev/Y             → host /dev/X, container /dev/Y, perms "rwm"
+//	/dev/X:/dev/Y:r           → full triple
+//
+// We treat anything starting with "/" as a path; CDI device IDs always
+// have the shape "<vendor>/<class>=<name>" which never starts with "/".
+func parsePathDeviceMapping(spec string) (docker.DeviceMapping, bool, error) {
+	if !strings.HasPrefix(spec, "/") {
+		return docker.DeviceMapping{}, false, nil
+	}
+	parts := strings.SplitN(spec, ":", 3)
+	mapping := docker.DeviceMapping{
+		PathOnHost:        parts[0],
+		PathInContainer:   parts[0],
+		CgroupPermissions: "rwm",
+	}
+	if len(parts) >= 2 && parts[1] != "" {
+		mapping.PathInContainer = parts[1]
+	}
+	if len(parts) == 3 && parts[2] != "" {
+		// Validate the permission triple like the docker CLI does: any
+		// non-empty, non-repeating combination of 'r', 'w' and 'm'.
+		// Catching this client-side gives a clear error instead of an
+		// opaque daemon-side failure at container creation time.
+		seen := make(map[rune]bool, 3)
+		for _, c := range parts[2] {
+			if (c != 'r' && c != 'w' && c != 'm') || seen[c] {
+				return docker.DeviceMapping{}, true, fmt.Errorf("invalid cgroup permissions %q in device spec %q: must be a combination of 'r', 'w' and 'm'", parts[2], spec)
+			}
+			seen[c] = true
+		}
+		mapping.CgroupPermissions = parts[2]
+	}
+	return mapping, true, nil
 }
