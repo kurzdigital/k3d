@@ -255,6 +255,17 @@
                 "kata"
               ]
             },
+            "autoGpu": {
+              "type": "string",
+              "enum": [
+                "",
+                "auto",
+                "nvidia",
+                "amd",
+                "intel",
+                "none"
+              ]
+            },
             "serversMemory": {
               "type": "string"
             },

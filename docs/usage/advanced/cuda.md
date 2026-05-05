@@ -7,7 +7,7 @@ If you are using Docker you can install the [NVIDIA Container Toolkit](https://d
 
 ## Choosing how to expose the GPU
 
-k3d offers four flags around GPU and device passthrough. Pick the right one(s) based on what your host runtime supports:
+k3d offers five flags around GPU and device passthrough. Pick the right one(s) based on what your host runtime supports:
 
 | Flag | When to use | Example |
 |------|-------------|---------|
@@ -15,8 +15,30 @@ k3d offers four flags around GPU and device passthrough. Pick the right one(s) b
 | `--device <CDI ID>` | Modern, Docker-native. Requires Docker 25+ and `nvidia-container-toolkit` configured in CDI mode (`/etc/cdi/*.yaml`). | `--device nvidia.com/gpu=all` |
 | `--device <path>` | Anything else: AMD ROCm (`/dev/kfd`, `/dev/dri`), Intel iGPU, FPGAs, FUSE, `/dev/kvm`, ... Plain host device passthrough. | `--device /dev/kfd --device /dev/dri:/dev/dri:rwm` |
 | `--runtime` | Use a non-default Docker runtime for the node containers. Required for the classic `nvidia` runtime if you need it to inject Vulkan ICD files (`/etc/vulkan/icd.d`) and libraries — neither `--gpus` nor `--device` does that. Also useful for `crun`, `kata`, etc. | `--runtime nvidia` |
+| `--auto-gpu` | Detect the host GPU vendor and apply matching `--gpus`/`--device` automatically. Useful in portable scripts that should work across NVIDIA/AMD/Intel hosts. Skipped if `--gpus` or `--device` is also set. | `--auto-gpu auto` |
 
-The flags are additive: `--gpus`, `--device`, and `--runtime` can be combined. A typical Vulkan-on-NVIDIA setup is `--runtime nvidia --gpus all`. The rest of this page focuses on the legacy `--gpus` path because that is what the custom CUDA image below depends on.
+The first four flags are additive: `--gpus`, `--device`, and `--runtime` can be combined. A typical Vulkan-on-NVIDIA setup is `--runtime nvidia --gpus all`. `--auto-gpu` is an opt-in convenience layer over the same fields. The rest of this page focuses on the legacy `--gpus` path because that is what the custom CUDA image below depends on.
+
+### `--auto-gpu` detection details
+
+| Environment | Detection chain |
+|-------------|-----------------|
+| Native Linux | `nvidia-smi` → `/dev/nvidia*` → `lspci -d 10de:/1002:/8086:` → `/sys/class/drm/renderD*/device/vendor` |
+| WSL2 | `nvidia-smi` → `vulkaninfo --summary` → `glxinfo -B` → `/dev/dxg` (warns if present but no detection tool installed) |
+| macOS | always reports "no GPU" (Docker Desktop's Linux VM has no GPU passthrough) |
+
+Mappings (only applied when no explicit `--gpus`/`--device` is set):
+
+- **NVIDIA** → `--gpus all` (legacy NVIDIA Container Toolkit hook). For Vulkan/ICD, also pass `--runtime nvidia`. For Docker 25+ with CDI, override the auto behavior with `--device nvidia.com/gpu=all`.
+- **AMD** → `--device /dev/dri:/dev/dri:rwm`, plus `--device /dev/kfd` if that node exists on the host (ROCm compute).
+- **Intel** → `--device /dev/dri:/dev/dri:rwm`.
+
+Accepted values for `--auto-gpu`: `auto` (run detection), `nvidia` / `amd` / `intel` (skip detection, apply mapping directly — useful when detection tools aren't installed), `none` (default, opt-out).
+
+!!! warning "Remote Docker daemons"
+    `--auto-gpu auto` runs its detection probes on the **client** machine, while the resulting device mappings are applied on the **daemon** host. If your Docker daemon is remote (e.g. via `DOCKER_HOST` or a remote context), detection will inspect the wrong machine and produce wrong results — use explicit `--gpus` / `--device` flags instead.
+
+For NVIDIA hosts, the mapping is only applied if the daemon actually supports NVIDIA passthrough (a registered CDI spec or an `nvidia` runtime). If a GPU is detected but the NVIDIA Container Toolkit is not set up on the daemon, k3d warns and skips the passthrough instead of creating a cluster that would fail to start.
 
 ## Building a customized K3s image
 

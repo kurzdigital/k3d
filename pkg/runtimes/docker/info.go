@@ -44,16 +44,18 @@ func (d Docker) Info() (*runtimeTypes.RuntimeInfo, error) {
 	}
 
 	runtimeInfo := runtimeTypes.RuntimeInfo{
-		Name:          d.ID(),
-		Endpoint:      d.GetRuntimePath(),
-		Version:       info.ServerVersion,
-		OS:            info.OperatingSystem,
-		OSType:        info.OSType,
-		Arch:          info.Architecture,
-		CgroupVersion: info.CgroupVersion,
-		CgroupDriver:  info.CgroupDriver,
-		Filesystem:    "UNKNOWN",
-		InfoName:      info.Name,
+		Name:             d.ID(),
+		Endpoint:         d.GetRuntimePath(),
+		Version:          info.ServerVersion,
+		OS:               info.OperatingSystem,
+		OSType:           info.OSType,
+		Arch:             info.Architecture,
+		CgroupVersion:    info.CgroupVersion,
+		CgroupDriver:     info.CgroupDriver,
+		Filesystem:       "UNKNOWN",
+		InfoName:         info.Name,
+		HasNvidiaCDI:     hasNvidiaCDIDevice(info.DiscoveredDevices),
+		HasNvidiaRuntime: hasNvidiaRuntime(info.Runtimes, info.DefaultRuntime),
 	}
 
 	// Get the backing filesystem for the storage driver

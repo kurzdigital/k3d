@@ -119,7 +119,7 @@ func NewCmdClusterCreate() *cobra.Command {
 				simpleCfg.Name = args[0]
 			}
 
-			if err := config.ProcessSimpleConfig(&simpleCfg); err != nil {
+			if err := config.ProcessSimpleConfig(&simpleCfg, runtimes.SelectedRuntime); err != nil {
 				l.Log().Fatalf("error processing/sanitizing simple config: %v", err)
 			}
 
@@ -320,6 +320,9 @@ func NewCmdClusterCreate() *cobra.Command {
 
 	cmd.Flags().String("runtime", "", "Select a non-default Docker runtime for the node containers (e.g. 'nvidia' for the classic NVIDIA Container Toolkit hook, exposing Vulkan ICDs and libraries). Defaults to the docker daemon's default runtime. [From docker]")
 	_ = cfgViper.BindPFlag("options.runtime.dockerruntime", cmd.Flags().Lookup("runtime"))
+
+	cmd.Flags().String("auto-gpu", "", "Auto-detect the host GPU vendor and apply matching --gpus / --device flags. Accepts 'auto' (detect via nvidia-smi/lspci/sysfs on Linux, vulkaninfo/glxinfo on WSL2), or an explicit vendor 'nvidia'/'amd'/'intel' (skip detection, apply mapping directly), or 'none' (default, no auto behavior). Explicit --gpus / --device flags always win. Note: detection inspects the LOCAL machine; with a remote Docker daemon (DOCKER_HOST) use explicit --gpus/--device instead.")
+	_ = cfgViper.BindPFlag("options.runtime.autogpu", cmd.Flags().Lookup("auto-gpu"))
 
 	cmd.Flags().String("servers-memory", "", "Memory limit imposed on the server nodes [From docker]")
 	_ = cfgViper.BindPFlag("options.runtime.serversmemory", cmd.Flags().Lookup("servers-memory"))
