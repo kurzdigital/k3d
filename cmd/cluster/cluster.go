@@ -49,6 +49,7 @@ func NewCmdCluster() *cobra.Command {
 		NewCmdClusterStop(),
 		NewCmdClusterDelete(),
 		NewCmdClusterRestart(),
+		NewCmdClusterRollout(),
 		NewCmdClusterList(),
 		NewCmdClusterEdit(),
 	)
