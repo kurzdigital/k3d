@@ -320,6 +320,17 @@ func TranslateContainerDetailsToNode(containerDetails types.ContainerJSON) (*k3d
 		l.Log().Debugf("failed to get IP for container %s as we couldn't find the cluster network", containerDetails.Name)
 	}
 
+	// K3dEntrypoint: nodes created with any K3D_FIX_* enabled run through the
+	// umbrella entrypoint. Reconstruct that from the container's actual
+	// entrypoint so callers can tell without relying on this process' env.
+	k3dEntrypoint := false
+	for _, ep := range containerDetails.Config.Entrypoint {
+		if ep == "/bin/k3d-entrypoint.sh" {
+			k3dEntrypoint = true
+			break
+		}
+	}
+
 	// HostConfig.Binds only includes explicit binds; anonymous volumes (auto-
 	// created by Docker for image VOLUME directives, e.g. /var/lib/rancher/k3s
 	// on the k3s image) live in containerDetails.Mounts. We surface them as
@@ -355,6 +366,7 @@ func TranslateContainerDetailsToNode(containerDetails types.ContainerJSON) (*k3d
 		Name:          strings.TrimPrefix(containerDetails.Name, "/"), // container name with leading '/' cut off
 		Role:          k3d.NodeRoles[containerDetails.Config.Labels[k3d.LabelRole]],
 		Image:         containerDetails.Image,
+		K3dEntrypoint: k3dEntrypoint,
 		Volumes:       volumes,
 		Env:           containerDetails.Config.Env,
 		Cmd:           containerDetails.Config.Cmd,

@@ -41,9 +41,18 @@ func NewCmdClusterRestart() *cobra.Command {
 
 	// create new command
 	cmd := &cobra.Command{
-		Use:               "restart [NAME [NAME...] | --all]",
-		Short:             "Restart existing k3d cluster(s)",
-		Long:              `Restart existing k3d cluster(s).`,
+		Use:   "restart [NAME [NAME...] | --all]",
+		Short: "Restart existing k3d cluster(s)",
+		Long: `Restart existing k3d cluster(s).
+
+Stops every node in parallel and starts them again, re-running the
+cluster-level post-start phase: HostAliases injection into /etc/hosts
+and CoreDNS configmap rebuild. Use this after host-side changes — new
+network gateway after a WLAN switch, Docker daemon restart, network
+recreate.
+
+For graceful pod cycling without recreating cluster state, see
+` + "`cluster rollout`" + `.`,
 		ValidArgsFunction: util.ValidArgsAvailableClusters,
 		Run: func(cmd *cobra.Command, args []string) {
 			clusters := parseRestartClusterCmd(cmd, args)
