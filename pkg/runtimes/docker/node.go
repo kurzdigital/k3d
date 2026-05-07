@@ -305,24 +305,11 @@ func (d Docker) GetNodeLogs(ctx context.Context, node *k3d.Node, since time.Time
 
 // ExecInNodeGetLogs executes a command inside a node and returns the logs to the caller, e.g. to parse them
 func (d Docker) ExecInNodeGetLogs(ctx context.Context, node *k3d.Node, cmd []string) (*bufio.Reader, error) {
-	resp, err := executeInNode(ctx, node, cmd, nil)
-	if resp != nil {
-		defer resp.Close()
+	logs, err := executeInNode(ctx, node, cmd, nil)
+	if logs == nil {
+		return nil, err
 	}
-
-	var logreader *bufio.Reader // backwards compatibility: TODO:(breaking) remove in future major version and return simple byte array or reader
-
-	if resp != nil && resp.Reader != nil {
-		logs, err := io.ReadAll(resp.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("error reading logs from exec process in node %s: %w", node.Name, err)
-		}
-		lr := bytes.NewReader(logs)
-		logreader = bufio.NewReader(lr)
-		resp.Close()
-	}
-
-	return logreader, err
+	return bufio.NewReader(bytes.NewReader(logs)), err
 }
 
 // GetImageStream creates a tar stream for the given images, to be read (and closed) by the caller
@@ -341,18 +328,9 @@ func (d Docker) ExecInNode(ctx context.Context, node *k3d.Node, cmd []string) er
 }
 
 func execInNode(ctx context.Context, node *k3d.Node, cmd []string, stdin io.ReadCloser) error {
-	execConnection, err := executeInNode(ctx, node, cmd, stdin)
-	if execConnection != nil {
-		defer execConnection.Close()
-	}
-	if err != nil {
-		if execConnection != nil && execConnection.Reader != nil {
-			logs, logsErr := io.ReadAll(execConnection.Reader)
-			if logsErr != nil {
-				return fmt.Errorf("failed to get logs from errored exec process in node '%s': %w", node.Name, logsErr)
-			}
-			err = fmt.Errorf("%w: Logs from failed access process:\n%s", err, string(logs))
-		}
+	logs, err := executeInNode(ctx, node, cmd, stdin)
+	if err != nil && len(logs) > 0 {
+		err = fmt.Errorf("%w: Logs from failed access process:\n%s", err, string(logs))
 	}
 	return err
 }
@@ -361,7 +339,18 @@ func (d Docker) ExecInNodeWithStdin(ctx context.Context, node *k3d.Node, cmd []s
 	return execInNode(ctx, node, cmd, stdin)
 }
 
-func executeInNode(ctx context.Context, node *k3d.Node, cmd []string, stdin io.ReadCloser) (*types.HijackedResponse, error) {
+// executeInNode runs cmd inside node's container, returning the captured
+// stdout/stderr bytes alongside any error.
+//
+// The hijacked stream from ContainerExecAttach is drained concurrently
+// with the Inspect-poll loop in a dedicated goroutine. Without that
+// drain, Docker engines that serialise per-container state access can
+// hold the container's state lock as long as the hijacked stream sits
+// unread, which makes ContainerExecInspect block until the outer
+// context expires — even for trivially short commands. This was
+// observed under daemon load, when many exec invocations land
+// back-to-back on the same daemon.
+func executeInNode(ctx context.Context, node *k3d.Node, cmd []string, stdin io.ReadCloser) ([]byte, error) {
 	l.Log().Debugf("Executing command '%+v' in node '%s'", cmd, node.Name)
 
 	// get the container for the given node
@@ -403,41 +392,80 @@ func executeInNode(ctx context.Context, node *k3d.Node, cmd []string, stdin io.R
 	if err != nil {
 		return nil, fmt.Errorf("docker failed to attach to exec process in node '%s': %w", node.Name, err)
 	}
+	defer execConnection.Close()
 
-	// If we need to write to stdin pipe, start a new goroutine that writes the stream to stdin
+	// Drain stdout/stderr concurrently with the inspect-loop. See function doc.
+	type drainResult struct {
+		bytes []byte
+		err   error
+	}
+	drainCh := make(chan drainResult, 1)
+	go func() {
+		b, drainErr := io.ReadAll(execConnection.Reader)
+		drainCh <- drainResult{bytes: b, err: drainErr}
+	}()
+
+	// Pump stdin in another goroutine, if requested.
 	if stdin != nil {
 		go func() {
-			_, err := io.Copy(execConnection.Conn, stdin)
-			if err != nil {
+			if _, err := io.Copy(execConnection.Conn, stdin); err != nil {
 				l.Log().Errorf("Failed to copy read stream. %v", err)
 			}
-			err = stdin.Close()
-			if err != nil {
+			if err := stdin.Close(); err != nil {
 				l.Log().Errorf("Failed to close stdin stream. %v", err)
 			}
 		}()
 	}
 
+	// abortAndCollectLogs is for error paths only: the daemon may keep the
+	// exec stream open indefinitely, so close the connection first to
+	// unblock the drain goroutine (io.ReadAll returns once the underlying
+	// connection is closed), then collect whatever was read. Any drain
+	// error is ignored here because the caller already has a primary error
+	// to report and the logs are merely supplementary.
+	abortAndCollectLogs := func() []byte {
+		execConnection.Close()
+		res := <-drainCh
+		return res.bytes
+	}
+
 	for {
 		// get info about exec process inside container
-		execInfo, err := docker.ContainerExecInspect(ctx, exec.ID)
-		if err != nil {
-			return &execConnection, fmt.Errorf("docker failed to inspect exec process in node '%s': %w", node.Name, err)
+		execInfo, inspectErr := docker.ContainerExecInspect(ctx, exec.ID)
+		if inspectErr != nil {
+			return abortAndCollectLogs(), fmt.Errorf("docker failed to inspect exec process in node '%s': %w", node.Name, inspectErr)
 		}
 
-		// if still running, continue loop
+		// if still running, continue loop (ctx-aware sleep so a cancelled
+		// context returns promptly rather than after a full second)
 		if execInfo.Running {
 			l.Log().Tracef("Exec process '%+v' still running in node '%s'.. sleeping for 1 second...", cmd, node.Name)
-			time.Sleep(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				return abortAndCollectLogs(), ctx.Err()
+			case <-time.After(1 * time.Second):
+			}
 			continue
 		}
 
-		// check exitcode
+		// Process exited: the daemon closes its end of the stream, so the
+		// drain goroutine finishes on its own; still honour ctx cancellation.
+		var logs []byte
+		select {
+		case res := <-drainCh:
+			if res.err != nil {
+				return res.bytes, fmt.Errorf("error reading logs from exec process in node '%s': %w", node.Name, res.err)
+			}
+			logs = res.bytes
+		case <-ctx.Done():
+			return abortAndCollectLogs(), ctx.Err()
+		}
+
 		if execInfo.ExitCode == 0 { // success
 			l.Log().Debugf("Exec process in node '%s' exited with '0'", node.Name)
-			return &execConnection, nil
+			return logs, nil
 		}
-		return &execConnection, fmt.Errorf("Exec process in node '%s' failed with exit code '%d'", node.Name, execInfo.ExitCode)
+		return logs, fmt.Errorf("Exec process in node '%s' failed with exit code '%d'", node.Name, execInfo.ExitCode)
 	}
 }
 
