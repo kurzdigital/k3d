@@ -152,10 +152,23 @@ func getNodeContainer(ctx context.Context, node *k3d.Node) (*types.Container, er
 	}
 	defer docker.Close()
 
-	// (1) list containers which have the default k3d labels attached
+	// (1) build filter
+	//
+	// Identity is the container name (k3d's <prefix>-<cluster>-<role>-<idx>
+	// is unique per Docker daemon) plus the static k3d marker labels — that
+	// rules out accidental matches against unrelated containers without
+	// over-constraining on user-mutable labels. Filtering by *all* of
+	// node.RuntimeLabels was actively wrong: user-mutable labels don't
+	// belong in an identity filter — anything that mutates Docker labels
+	// post-create makes the in-memory snapshot drift from the live
+	// container, and the lookup returns zero hits even though the
+	// container is clearly there.
 	filters := filters.NewArgs()
-	for k, v := range node.RuntimeLabels {
+	for k, v := range k3d.DefaultRuntimeLabels {
 		filters.Add("label", fmt.Sprintf("%s=%s", k, v))
+	}
+	if cluster, ok := node.RuntimeLabels[k3d.LabelClusterName]; ok && cluster != "" {
+		filters.Add("label", fmt.Sprintf("%s=%s", k3d.LabelClusterName, cluster))
 	}
 
 	// regex filtering for exact name match
