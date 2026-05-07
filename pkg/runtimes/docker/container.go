@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -35,6 +36,22 @@ import (
 	l "github.com/k3d-io/k3d/v5/pkg/logger"
 	k3d "github.com/k3d-io/k3d/v5/pkg/types"
 	"github.com/sirupsen/logrus"
+)
+
+// getNodeContainerLookupRetries / getNodeContainerLookupBackoff bound the
+// short retry that getNodeContainer does on zero-result lookups. NodeReplace
+// renames the old container, then creates the new one under the original
+// name — for a sub-second window, the original name has zero containers
+// attached. Callers iterating the cluster from another goroutine (or a
+// stale snapshot) can otherwise hit "Didn't find container" mid-replace.
+//
+// 5 attempts with a 200ms sleep between them (i.e. 4 × 200ms = 800ms
+// worst case) for a missing container that legitimately stays missing —
+// small enough to not change the user-visible feedback when a node
+// really is gone.
+const (
+	getNodeContainerLookupRetries = 5
+	getNodeContainerLookupBackoff = 200 * time.Millisecond
 )
 
 // createContainer creates a new docker container from translated specs
@@ -147,23 +164,37 @@ func getNodeContainer(ctx context.Context, node *k3d.Node) (*types.Container, er
 	// -> user input may or may not have the "k3d-" prefix
 	filters.Add("name", fmt.Sprintf("^/?(%s-)?%s$", k3d.DefaultObjectNamePrefix, node.Name))
 
-	containers, err := docker.ContainerList(ctx, container.ListOptions{
-		Filters: filters,
-		All:     true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("Failed to list containers: %+v", err)
-	}
+	// Bounded retry on zero-result lookups: NodeReplace renames the old
+	// container before creating the new one under the original name, so a
+	// caller racing that window briefly sees nothing at the original name.
+	// Errors and ambiguous (>1) results return immediately — those are not
+	// transient.
+	for attempt := 0; attempt < getNodeContainerLookupRetries; attempt++ {
+		containers, err := docker.ContainerList(ctx, container.ListOptions{
+			Filters: filters,
+			All:     true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("Failed to list containers: %+v", err)
+		}
+		if len(containers) > 1 {
+			return nil, fmt.Errorf("Failed to get a single container for name '%s'. Found: %d", node.Name, len(containers))
+		}
+		if len(containers) == 1 {
+			return &containers[0], nil
+		}
 
-	if len(containers) > 1 {
-		return nil, fmt.Errorf("Failed to get a single container for name '%s'. Found: %d", node.Name, len(containers))
+		if attempt == getNodeContainerLookupRetries-1 {
+			break
+		}
+		l.Log().Tracef("getNodeContainer: 0 results for '%s' on attempt %d/%d (possible NodeReplace rename race), retrying in %s", node.Name, attempt+1, getNodeContainerLookupRetries, getNodeContainerLookupBackoff)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(getNodeContainerLookupBackoff):
+		}
 	}
-
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("Didn't find container for node '%s'", node.Name)
-	}
-
-	return &containers[0], nil
+	return nil, fmt.Errorf("Didn't find container for node '%s'", node.Name)
 }
 
 // executes an arbitrary command in a container while returning its exit code.
