@@ -50,6 +50,7 @@ func NewCmdCluster() *cobra.Command {
 		NewCmdClusterDelete(),
 		NewCmdClusterRestart(),
 		NewCmdClusterRollout(),
+		NewCmdClusterReconfigure(),
 		NewCmdClusterUpdateEnvironment(),
 		NewCmdClusterList(),
 		NewCmdClusterEdit(),
