@@ -940,6 +940,9 @@ type NodeEditPortBinding struct {
 
 type NodeEditChangeset struct {
 	Ports map[nat.Port][]NodeEditPortBinding
+	// Image, if non-nil, replaces the container image. Used by `cluster reconfigure`
+	// for rolling upgrades — triggers a NodeReplace with the new image.
+	Image *string
 }
 
 // NodeEdit let's you update an existing node
@@ -988,6 +991,12 @@ func NodeEdit(ctx context.Context, runtime runtimes.Runtime, existingNode *k3d.N
 				result.Ports[port] = append(result.Ports[port], portbinding.PortBinding)
 			}
 		}
+	}
+
+	// === Image ===
+	if changeset.Image != nil && *changeset.Image != "" {
+		l.Log().Tracef("Updating image of node %s: %s -> %s", existingNode.Name, result.Image, *changeset.Image)
+		result.Image = *changeset.Image
 	}
 
 	// --- Loadbalancer specifics ---
