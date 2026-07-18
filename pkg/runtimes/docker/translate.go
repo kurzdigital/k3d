@@ -362,10 +362,19 @@ func TranslateContainerDetailsToNode(containerDetails types.ContainerJSON) (*k3d
 		bindDests[m.Destination] = struct{}{}
 	}
 
+	// Prefer the image *reference* the container was created with over the
+	// resolved image ID (ContainerJSONBase.Image is a sha256 digest): specs
+	// reconstructed for comparison or node recreation should carry the same
+	// form of reference the user (and the create path) uses.
+	imageRef := containerDetails.Config.Image
+	if imageRef == "" {
+		imageRef = containerDetails.Image
+	}
+
 	node := &k3d.Node{
 		Name:          strings.TrimPrefix(containerDetails.Name, "/"), // container name with leading '/' cut off
 		Role:          k3d.NodeRoles[containerDetails.Config.Labels[k3d.LabelRole]],
-		Image:         containerDetails.Image,
+		Image:         imageRef,
 		K3dEntrypoint: k3dEntrypoint,
 		Volumes:       volumes,
 		Env:           containerDetails.Config.Env,
