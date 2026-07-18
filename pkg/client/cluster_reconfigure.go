@@ -42,6 +42,13 @@ import (
 	k3d "github.com/k3d-io/k3d/v5/pkg/types"
 )
 
+// replaceNodeTimeout bounds one full node replacement inside a rolling
+// reconfigure (etcd rotation, container recreate incl. a potential image
+// pull, start and readiness wait). Deliberately generous — aborting kicks
+// off NodeReplace's rollback, so a timeout on a slow image pull is
+// recoverable but annoying.
+const replaceNodeTimeout = 15 * time.Minute
+
 // ClusterReconfigureOpts configures a rolling reconfigure run.
 type ClusterReconfigureOpts struct {
 	// Image, if non-empty, replaces the k3s image of every server and agent
@@ -136,7 +143,26 @@ func buildNodeChangesetFromOpts(opts ClusterReconfigureOpts) *NodeEditChangeset 
 // Post-flight per server: refresh the loadbalancer config so its
 // DNS-based upstreams pick up the new container IP.
 func makeReplaceOp(changeset *NodeEditChangeset) PerNodeOp {
+	return makeReplaceOpFn(func(*k3d.Node) *NodeEditChangeset { return changeset })
+}
+
+// makeReplaceOpFn is the per-node-changeset variant of makeReplaceOp: the
+// changeset to apply is resolved per node, which lets `reconfigure -c`
+// apply different spec changes to different nodes in one traversal.
+// The whole per-node replacement is bounded by replaceNodeTimeout: without
+// a bound, a replacement container whose k3s process dies before logging
+// readiness (e.g. a k3s arg that crashes the kubelet) would hang the
+// NodeStart wait — and thereby the whole reconfigure — forever.
+func makeReplaceOpFn(changesetFor func(node *k3d.Node) *NodeEditChangeset) PerNodeOp {
 	return func(ctx context.Context, runtime k3drt.Runtime, cluster *k3d.Cluster, node *k3d.Node) error {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, replaceNodeTimeout)
+		defer cancel()
+
+		changeset := changesetFor(node)
+		if changeset == nil {
+			return fmt.Errorf("no changeset resolved for node '%s' — filter and changeset map out of sync", node.Name)
+		}
 		// k3s stores a per-node password as <node>.node-password.k3s in
 		// kube-system. NodeReplace destroys /etc/rancher/node/password
 		// along with the old container; the new container generates a

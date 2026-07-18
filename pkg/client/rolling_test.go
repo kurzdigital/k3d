@@ -234,6 +234,7 @@ func TestCheckRollingPreconditions(t *testing.T) {
 		serverTotal      int
 		serversRunning   int
 		entrypointActive bool
+		agentOnly        bool // traversal touches no server nodes
 		force            bool
 		wantErr          bool
 	}{
@@ -308,11 +309,28 @@ func TestCheckRollingPreconditions(t *testing.T) {
 			entrypointActive: false,
 			force:            true, // force needed for the <2-server datastore guard
 		},
+		{
+			name:             "ok: agent-only traversal waives server preconditions",
+			cluster:          noDatastore,
+			serverTotal:      1,
+			serversRunning:   1,
+			entrypointActive: false,
+			agentOnly:        true,
+		},
+		{
+			name:             "abort: agent-only traversal still requires all servers running",
+			cluster:          noDatastore,
+			serverTotal:      2,
+			serversRunning:   1,
+			entrypointActive: true,
+			agentOnly:        true,
+			wantErr:          true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := checkRollingPreconditions(tt.cluster, tt.serverTotal, tt.serversRunning, tt.entrypointActive, tt.force)
+			err := checkRollingPreconditions(tt.cluster, tt.serverTotal, tt.serversRunning, tt.entrypointActive, !tt.agentOnly, tt.force)
 			if tt.wantErr {
 				require.Error(t, err)
 			} else {

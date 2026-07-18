@@ -65,6 +65,13 @@ type RollingApplyOpts struct {
 
 	// Op is the per-node mutation. Required.
 	Op PerNodeOp
+
+	// Filter, if non-nil, limits the traversal to nodes it returns true
+	// for. Skipped nodes are neither drained nor otherwise touched. If no
+	// server-role node passes the filter, the server-specific
+	// preconditions (single-server API downtime, umbrella entrypoint) are
+	// waived — they only guard server replacements.
+	Filter func(node *k3d.Node) bool
 }
 
 // RollingApply walks the cluster's nodes one at a time, applying Op to each
@@ -105,15 +112,29 @@ func RollingApply(ctx context.Context, runtime k3drt.Runtime, cluster *k3d.Clust
 		return fmt.Errorf("failed to refresh cluster '%s': %w", cluster.Name, err)
 	}
 
-	serverTotal, serversRunning := cluster.ServerCountRunning()
-	if err := checkRollingPreconditions(cluster, serverTotal, serversRunning, serverEntrypointActive(cluster), opts.Force); err != nil {
-		return err
-	}
+	include := func(n *k3d.Node) bool { return opts.Filter == nil || opts.Filter(n) }
 
 	initServer, servers, agents := partitionNodesForRolling(cluster.Nodes)
 
+	serverAffected := initServer != nil && include(initServer)
+	for _, server := range servers {
+		if include(server) {
+			serverAffected = true
+			break
+		}
+	}
+
+	serverTotal, serversRunning := cluster.ServerCountRunning()
+	if err := checkRollingPreconditions(cluster, serverTotal, serversRunning, serverEntrypointActive(cluster), serverAffected, opts.Force); err != nil {
+		return err
+	}
+
 	// Non-init servers first.
 	for _, server := range servers {
+		if !include(server) {
+			l.Log().Debugf("RollingApply: skipping unaffected server '%s'", server.Name)
+			continue
+		}
 		if err := rollingProcessNode(ctx, runtime, cluster, server, opts); err != nil {
 			return fmt.Errorf("failed on server '%s': %w", server.Name, err)
 		}
@@ -122,7 +143,7 @@ func RollingApply(ctx context.Context, runtime k3drt.Runtime, cluster *k3d.Clust
 	// Init server next — the other servers are already cycled, so handing
 	// off etcd leadership before the swap is safe. The op owns any special
 	// prep (etcd member-remove + data-wipe + K3S_URL injection).
-	if initServer != nil {
+	if initServer != nil && include(initServer) {
 		if err := rollingProcessNode(ctx, runtime, cluster, initServer, opts); err != nil {
 			return fmt.Errorf("failed on init server '%s': %w", initServer.Name, err)
 		}
@@ -131,6 +152,10 @@ func RollingApply(ctx context.Context, runtime k3drt.Runtime, cluster *k3d.Clust
 	// Agents last — the whole control plane is cycled first, so a kubelet
 	// never ends up newer than the apiserver it talks to.
 	for _, agent := range agents {
+		if !include(agent) {
+			l.Log().Debugf("RollingApply: skipping unaffected agent '%s'", agent.Name)
+			continue
+		}
 		if err := rollingProcessNode(ctx, runtime, cluster, agent, opts); err != nil {
 			return fmt.Errorf("failed on agent '%s': %w", agent.Name, err)
 		}
@@ -309,10 +334,16 @@ func clusterHasExternalDatastore(cluster *k3d.Cluster) bool {
 // checkRollingPreconditions validates a cluster against the abortable
 // preconditions of a rolling traversal. entrypointActive reports whether all
 // server nodes run through the umbrella entrypoint (see
-// serverEntrypointActive). The latter two checks are overridable with force.
-func checkRollingPreconditions(cluster *k3d.Cluster, serverTotal, serversRunning int, entrypointActive, force bool) error {
+// serverEntrypointActive); serverAffected reports whether any server-role
+// node is part of the traversal — the server-specific checks only apply
+// then. The latter two checks are overridable with force.
+func checkRollingPreconditions(cluster *k3d.Cluster, serverTotal, serversRunning int, entrypointActive, serverAffected, force bool) error {
 	if serversRunning < serverTotal {
 		return fmt.Errorf("cluster '%s' has %d/%d servers running — start the cluster first", cluster.Name, serversRunning, serverTotal)
+	}
+
+	if !serverAffected {
+		return nil
 	}
 
 	if !force && cluster.ExternalDatastore == nil && !clusterHasExternalDatastore(cluster) && serversRunning < 2 {
