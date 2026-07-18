@@ -714,11 +714,62 @@ func ClusterDelete(ctx context.Context, runtime k3drt.Runtime, cluster *k3d.Clus
 		}
 	}
 
+	// Delete volumes that started out as anonymous (auto-created by Docker
+	// for image VOLUME directives) but were re-mounted by name when a node
+	// was recreated from its reconstructed spec (NodeReplace). Docker only
+	// auto-removes volumes it still considers anonymous, so these would
+	// leak on cluster deletion otherwise. Deletion failures are expected
+	// for volumes that were still anonymous (removed with their container).
+	for _, vol := range adoptedAnonymousVolumes(cluster.Nodes) {
+		l.Log().Debugf("Deleting adopted anonymous volume %s...", vol)
+		if err := runtime.DeleteVolume(ctx, vol); err != nil {
+			l.Log().Debugf("Failed to delete adopted anonymous volume '%s' of cluster '%s' (likely already removed with its container): %v", vol, cluster.Name, err)
+		}
+	}
+
 	// return error if we failed to delete a node
 	if failed > 0 {
 		return fmt.Errorf("Failed to delete %d nodes: Try to delete them manually", failed)
 	}
 	return nil
+}
+
+// adoptedAnonymousVolumes returns the (deduplicated) names of volumes that
+// Docker originally created anonymously (64-char hex names) but that are
+// mounted by name on the given nodes — the result of the runtime surfacing
+// anonymous volumes as pseudo-binds so NodeReplace preserves them across
+// container recreation.
+func adoptedAnonymousVolumes(nodes []*k3d.Node) []string {
+	seen := map[string]struct{}{}
+	result := []string{}
+	for _, node := range nodes {
+		for _, volume := range node.Volumes {
+			src, _, found := strings.Cut(volume, ":")
+			if !found || !isAnonymousVolumeName(src) {
+				continue
+			}
+			if _, dup := seen[src]; dup {
+				continue
+			}
+			seen[src] = struct{}{}
+			result = append(result, src)
+		}
+	}
+	return result
+}
+
+// isAnonymousVolumeName reports whether name looks like a Docker-generated
+// anonymous volume name: exactly 64 lowercase hex characters.
+func isAnonymousVolumeName(name string) bool {
+	if len(name) != 64 {
+		return false
+	}
+	for _, c := range name {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // ClusterList returns a list of all existing clusters
