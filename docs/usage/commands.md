@@ -50,6 +50,13 @@ k3d
       --force  # allow rollout on a single-server cluster despite the resulting API downtime (default: false)
       --drain-timeout  # per-agent timeout for kubectl drain (duration, e.g. '10s', default: 60s)
       --ready-timeout  # per-node timeout to become Ready after restart (duration, e.g. '10s', default: 120s)
+    reconfigure CLUSTER  # [EXPERIMENTAL] rolling replace of nodes with a changed spec
+      --image  # new k3s image to roll out across server and agent nodes (string)
+      -c, --config  # SimpleConfig file describing the desired cluster spec; differing nodes are replaced (format: 'PATH')
+      --dry-run  # only print the per-node diff against the config file, change nothing (default: false)
+      --force  # allow replacing servers of a single-server cluster despite the resulting API downtime (default: false)
+      --drain-timeout  # per-node timeout for kubectl drain (duration, default: 60s)
+      --ready-timeout  # per-node timeout to become Ready after replacement (duration, default: 120s)
   completion [bash | zsh | fish | (psh | powershell)]  # generate completion scripts for common shells
   config
     init  # write a default k3d config (as a starting point)

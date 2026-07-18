@@ -943,6 +943,11 @@ type NodeEditChangeset struct {
 	// Image, if non-nil, replaces the container image. Used by `cluster reconfigure`
 	// for rolling upgrades — triggers a NodeReplace with the new image.
 	Image *string
+	// Spec, if non-nil, replaces the whole user-scope portion of the node
+	// spec (image, volumes, k3s args, env, k3s node labels, memory) while
+	// preserving the k3d-managed portion. Used by `cluster reconfigure -c`.
+	// Applied before the Ports/Image patches above.
+	Spec *NodeSpecChangeset
 }
 
 // NodeEdit let's you update an existing node
@@ -959,6 +964,11 @@ func NodeEdit(ctx context.Context, runtime runtimes.Runtime, existingNode *k3d.N
 	/*
 	 * Apply changes
 	 */
+
+	// === Full user-scope spec replacement ===
+	if changeset.Spec != nil {
+		applySpecChangeset(runtime, result, changeset.Spec)
+	}
 
 	// === Ports ===
 	if result.Ports == nil {
