@@ -1307,29 +1307,5 @@ func ClusterEditChangesetSimple(ctx context.Context, runtime k3drt.Runtime, clus
 
 	l.Log().Debugf("ORIGINAL:\n> Ports: %+v\n> Config: %+v\nCHANGESET:\n> Ports: %+v\n> Config: %+v", existingLB.Node.Ports, existingLB.Config, lbChangeset.Node.Ports, lbChangeset.Config)
 
-	// prepare to write config to lb container
-	configyaml, err := yaml.Marshal(lbChangeset.Config)
-	if err != nil {
-		return fmt.Errorf("failed to marshal loadbalancer config changeset: %w", err)
-	}
-	writeLbConfigAction := k3d.NodeHook{
-		Stage: k3d.LifecycleStagePreStart,
-		Action: actions.WriteFileAction{
-			Runtime:     runtime,
-			Dest:        k3d.DefaultLoadbalancerConfigPath,
-			Mode:        0744,
-			Content:     configyaml,
-			Description: "Write Loadbalancer Configuration",
-		},
-	}
-	if lbChangeset.Node.HookActions == nil {
-		lbChangeset.Node.HookActions = []k3d.NodeHook{}
-	}
-	lbChangeset.Node.HookActions = append(lbChangeset.Node.HookActions, writeLbConfigAction)
-
-	if err := NodeReplace(ctx, runtime, existingLB.Node, lbChangeset.Node); err != nil {
-		return fmt.Errorf("error replacing loadbalancer node: %w", err)
-	}
-
-	return nil
+	return replaceLoadbalancer(ctx, runtime, existingLB.Node, lbChangeset.Node.Ports, lbChangeset.Config)
 }

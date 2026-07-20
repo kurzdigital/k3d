@@ -58,19 +58,33 @@ Two modes:
   -c CONFIGFILE   diff a SimpleConfig file (same format as 'cluster create -c')
                   against the running cluster and replace exactly the nodes
                   whose spec differs (volumes, k3s args, env, k3s node
-                  labels, memory, image). Unchanged nodes are not touched.
-                  With --dry-run the per-node diff is printed and nothing
-                  is changed.
+                  labels, memory, image). Serverlb port mappings (incl. the
+                  kube-api host port) are applied by replacing only the
+                  loadbalancer container. Unchanged nodes are not touched.
+                  With --dry-run the per-node and per-port diff is printed
+                  and nothing is changed.
 
 Config-diff semantics: the config file describes the *desired* state of the
 user-configurable node spec. An omitted image field means "keep the image
 each node currently runs" (it does not reset to the default k3s image).
 Applying the same file twice is a no-op; removing an entry (e.g. a volume
 mount) from the file removes it from the nodes on the next apply. Changes that cannot be applied by replacing nodes
-(network, subnet, token, node count, cluster-wide serverlb port mappings)
+(network, subnet, token, node count)
 abort with an error naming them; aspects that cannot be compared against a
 running cluster (registries, hostAliases, runtime ulimits/labels, files,
 gpus) are reported as not-diffed instead of being silently ignored.
+
+Serverlb port-mapping changes (ports section, and an explicitly requested
+kube-api host port via kubeAPI.hostPort) are applied by replacing only the
+loadbalancer container — no node drain, no etcd rotation, and no --force
+required, matching 'k3d cluster edit --port-add' which replaces the
+loadbalancer the same way. Ingress traffic and API access through the
+loadbalancer drop for a few seconds during the replacement; the control
+plane itself keeps running. If the kube-api host port changed, the default
+kubeconfig is updated automatically; externally saved kubeconfig copies
+must be refreshed manually ('k3d kubeconfig get/merge' reflect the new
+port). Without a loadbalancer (--no-lb clusters), port changes still
+require a cluster recreate.
 
 Replacement order: non-init servers, then init server, then agents — same
 convention as kubeadm and OKD, so the kube version skew policy

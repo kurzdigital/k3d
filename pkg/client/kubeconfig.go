@@ -137,6 +137,22 @@ func KubeconfigGet(ctx context.Context, runtime runtimes.Runtime, cluster *k3d.C
 	if chosenServer == nil {
 		chosenServer = serverNodes[0]
 	}
+
+	// The kube-api host binding lives on the serverlb container (if the
+	// cluster has one), and `cluster reconfigure -c` can change it by
+	// replacing only the loadbalancer — the servers' k3d.server.api.port
+	// labels (read above) then still hold the create-time value, because
+	// container labels are immutable. The LB's actual published binding is
+	// therefore the ground truth for the port.
+	if lbNodes, err := runtime.GetNodesByLabel(ctx, map[string]string{k3d.LabelClusterName: cluster.Name, k3d.LabelRole: string(k3d.LoadBalancerRole)}); err == nil {
+		for _, lb := range lbNodes {
+			if _, binding, ok := nodeAPIPortBinding(lb); ok && binding.HostPort != "" {
+				APIPort = binding.HostPort
+				break
+			}
+		}
+	}
+
 	// get the kubeconfig from the first server node
 	reader, err := runtime.GetKubeconfig(ctx, chosenServer)
 	if err != nil {

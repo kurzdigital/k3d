@@ -36,6 +36,7 @@ import (
 	"github.com/spf13/viper"
 	"sigs.k8s.io/yaml"
 
+	"github.com/k3d-io/k3d/v5/pkg/actions"
 	l "github.com/k3d-io/k3d/v5/pkg/logger"
 	"github.com/k3d-io/k3d/v5/pkg/runtimes"
 	k3d "github.com/k3d-io/k3d/v5/pkg/types"
@@ -107,6 +108,43 @@ func UpdateLoadbalancerConfig(ctx context.Context, runtime runtimes.Runtime, clu
 	l.Log().Infof("Successfully configured loadbalancer %s!", cluster.ServerLoadBalancer.Node.Name)
 
 	time.Sleep(1 * time.Second) // waiting for a second, to avoid issues with too fast lb updates which would screw up the log waits
+
+	return nil
+}
+
+// replaceLoadbalancer recreates the serverlb container with the given host
+// port set and loadbalancer config — the shared tail of `cluster edit` and
+// `cluster reconfigure -c`. The replacement is a copy of the existing node,
+// so all k3d-managed aspects (runtime labels, networks, image, restart
+// policy) are preserved; only the published ports and the LB config change.
+func replaceLoadbalancer(ctx context.Context, runtime runtimes.Runtime, existing *k3d.Node, ports nat.PortMap, config *k3d.LoadbalancerConfig) error {
+	replacement, err := CopyNode(ctx, existing, CopyNodeOpts{keepState: false})
+	if err != nil {
+		return fmt.Errorf("error copying existing loadbalancer: %w", err)
+	}
+	replacement.Ports = ports
+
+	configyaml, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal loadbalancer config: %w", err)
+	}
+	if replacement.HookActions == nil {
+		replacement.HookActions = []k3d.NodeHook{}
+	}
+	replacement.HookActions = append(replacement.HookActions, k3d.NodeHook{
+		Stage: k3d.LifecycleStagePreStart,
+		Action: actions.WriteFileAction{
+			Runtime:     runtime,
+			Dest:        k3d.DefaultLoadbalancerConfigPath,
+			Mode:        0744,
+			Content:     configyaml,
+			Description: "Write Loadbalancer Configuration",
+		},
+	})
+
+	if err := NodeReplace(ctx, runtime, existing, replacement); err != nil {
+		return fmt.Errorf("error replacing loadbalancer node: %w", err)
+	}
 
 	return nil
 }
