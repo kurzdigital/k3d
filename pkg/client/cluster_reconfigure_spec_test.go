@@ -22,13 +22,16 @@ THE SOFTWARE.
 package client
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
+	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	conf "github.com/k3d-io/k3d/v5/pkg/config/v1alpha5"
+	l "github.com/k3d-io/k3d/v5/pkg/logger"
 	k3d "github.com/k3d-io/k3d/v5/pkg/types"
 )
 
@@ -254,6 +257,169 @@ func TestApplySpecRoundtrip(t *testing.T) {
 	assert.Empty(t, rediff.Changes, "re-diff after apply must be empty: %+v", rediff.Changes)
 }
 
+// exposure builds a kube-api ExposureOpts with the given host binding
+// (ExposureOpts embeds nat.PortMapping, so the binding cannot be set in a
+// plain struct literal).
+func exposure(hostIP, hostPort string) *k3d.ExposureOpts {
+	e := &k3d.ExposureOpts{}
+	e.Binding = nat.PortBinding{HostIP: hostIP, HostPort: hostPort}
+	return e
+}
+
+// reconstructedLB builds a node the way ClusterGet would reconstruct the
+// serverlb container: runtime-normalized port keys ("80/tcp"), k3d labels.
+func reconstructedLB(ports nat.PortMap) *k3d.Node {
+	return &k3d.Node{
+		Name:  "k3d-test-serverlb",
+		Role:  k3d.LoadBalancerRole,
+		Image: "ghcr.io/k3d-io/k3d-proxy:5",
+		Ports: ports,
+		RuntimeLabels: map[string]string{
+			k3d.LabelClusterName: "test",
+		},
+	}
+}
+
+// targetLBNode builds a loadbalancer node the way the config transform
+// produces it: user ports from TransformPorts plus the kube-api binding
+// under the bare "6443" key (LoadbalancerPrepare).
+func targetLBNode(userPorts nat.PortMap, apiBinding nat.PortBinding) *k3d.Node {
+	ports := nat.PortMap{}
+	for p, b := range userPorts {
+		ports[p] = append([]nat.PortBinding{}, b...)
+	}
+	ports[nat.Port(k3d.DefaultAPIPort)] = []nat.PortBinding{apiBinding}
+	return &k3d.Node{
+		Name:  "k3d-test-serverlb",
+		Role:  k3d.LoadBalancerRole,
+		Ports: ports,
+	}
+}
+
+func TestDiffLoadBalancerSpec(t *testing.T) {
+	apiActual := nat.PortMap{"6443/tcp": {{HostIP: "0.0.0.0", HostPort: "16443"}}}
+
+	t.Run("identical port sets are a no-op", func(t *testing.T) {
+		actual := reconstructedLB(nat.PortMap{
+			"80/tcp":   {{HostIP: "0.0.0.0", HostPort: "8080"}},
+			"6443/tcp": {{HostIP: "0.0.0.0", HostPort: "16443"}},
+		})
+		target := targetLBNode(nat.PortMap{
+			"80/tcp": {{HostIP: "0.0.0.0", HostPort: "8080"}},
+		}, nat.PortBinding{HostIP: "0.0.0.0", HostPort: "16443"})
+		assert.Nil(t, diffLoadBalancerSpec(target, actual, exposure("", "16443")))
+	})
+
+	t.Run("added and removed mappings are classified", func(t *testing.T) {
+		actual := reconstructedLB(nat.PortMap{
+			"80/tcp":   {{HostIP: "0.0.0.0", HostPort: "10080"}},
+			"6443/tcp": {{HostIP: "0.0.0.0", HostPort: "16443"}},
+		})
+		target := targetLBNode(nat.PortMap{
+			"80/tcp": {{HostIP: "0.0.0.0", HostPort: "8080"}},
+		}, nat.PortBinding{})
+
+		diff := diffLoadBalancerSpec(target, actual, nil)
+		require.NotNil(t, diff)
+		assert.Equal(t, []string{"80/tcp->0.0.0.0:8080"}, diff.Added)
+		assert.Equal(t, []string{"80/tcp->0.0.0.0:10080"}, diff.Removed)
+		assert.Nil(t, diff.KubeAPI)
+
+		// desired port set carries the new mapping and keeps the actual
+		// (possibly auto-assigned) kube-api binding untouched
+		assert.Equal(t, []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: "8080"}}, diff.DesiredPorts["80/tcp"])
+		assert.Equal(t, []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: "16443"}}, diff.DesiredPorts["6443/tcp"])
+	})
+
+	t.Run("revocation: mapping removed from config leaves the desired set", func(t *testing.T) {
+		actual := reconstructedLB(nat.PortMap{
+			"80/tcp":   {{HostIP: "0.0.0.0", HostPort: "8080"}},
+			"443/tcp":  {{HostIP: "0.0.0.0", HostPort: "8443"}},
+			"6443/tcp": {{HostIP: "0.0.0.0", HostPort: "16443"}},
+		})
+		target := targetLBNode(nat.PortMap{
+			"80/tcp": {{HostIP: "0.0.0.0", HostPort: "8080"}},
+		}, nat.PortBinding{})
+
+		diff := diffLoadBalancerSpec(target, actual, nil)
+		require.NotNil(t, diff)
+		assert.Empty(t, diff.Added)
+		assert.Equal(t, []string{"443/tcp->0.0.0.0:8443"}, diff.Removed)
+		assert.NotContains(t, diff.DesiredPorts, nat.Port("443/tcp"))
+		assert.Contains(t, diff.DesiredPorts, nat.Port("80/tcp"))
+	})
+
+	t.Run("kube-api host port change is folded in, HostIP preserved", func(t *testing.T) {
+		actual := reconstructedLB(nat.PortMap{
+			"6443/tcp": {{HostIP: "127.0.0.1", HostPort: "16443"}},
+		})
+		target := targetLBNode(nat.PortMap{}, nat.PortBinding{HostIP: "0.0.0.0", HostPort: "6445"})
+
+		diff := diffLoadBalancerSpec(target, actual, exposure("0.0.0.0", "6445"))
+		require.NotNil(t, diff)
+		assert.Empty(t, diff.Added)
+		assert.Empty(t, diff.Removed)
+		require.NotNil(t, diff.KubeAPI)
+		assert.Equal(t, []string{"16443"}, diff.KubeAPI.Current)
+		assert.Equal(t, []string{"6445"}, diff.KubeAPI.Desired)
+		// HostIP is not diffed and therefore preserved from the actual binding
+		assert.Equal(t, []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: "6445"}}, diff.DesiredPorts["6443/tcp"])
+	})
+
+	t.Run("unset or random kube-api host port is not diffed", func(t *testing.T) {
+		actual := reconstructedLB(apiActual)
+		target := targetLBNode(nat.PortMap{}, nat.PortBinding{})
+		assert.Nil(t, diffLoadBalancerSpec(target, actual, exposure("", "")))
+		assert.Nil(t, diffLoadBalancerSpec(target, actual, exposure("", "random")))
+		assert.Nil(t, diffLoadBalancerSpec(target, actual, nil))
+	})
+
+	t.Run("idempotence: applying the desired ports empties the diff", func(t *testing.T) {
+		actual := reconstructedLB(nat.PortMap{
+			"80/tcp":   {{HostIP: "0.0.0.0", HostPort: "10080"}},
+			"6443/tcp": {{HostIP: "0.0.0.0", HostPort: "16443"}},
+		})
+		target := targetLBNode(nat.PortMap{
+			"80/tcp": {{HostIP: "0.0.0.0", HostPort: "8080"}},
+		}, nat.PortBinding{HostIP: "0.0.0.0", HostPort: "6445"})
+		kubeAPI := exposure("0.0.0.0", "6445")
+
+		diff := diffLoadBalancerSpec(target, actual, kubeAPI)
+		require.NotNil(t, diff)
+		require.NotNil(t, diff.KubeAPI)
+
+		// simulate the apply: the replacement container publishes exactly
+		// the desired port set
+		applied := reconstructedLB(diff.DesiredPorts)
+		assert.Nil(t, diffLoadBalancerSpec(target, applied, kubeAPI), "re-diff after apply must be empty")
+	})
+}
+
+func TestRenderLoadBalancerDiff(t *testing.T) {
+	var buf bytes.Buffer
+	logger := l.Log()
+	oldOut := logger.Out
+	logger.SetOutput(&buf)
+	defer logger.SetOutput(oldOut)
+
+	d := &ClusterSpecDiff{
+		LoadBalancer: &LoadBalancerSpecDiff{
+			NodeName: "k3d-test-serverlb",
+			Added:    []string{"80/tcp->0.0.0.0:8080"},
+			Removed:  []string{"80/tcp->0.0.0.0:10080"},
+			KubeAPI:  &FieldDiff{Field: "kube-api host port", Current: []string{"16443"}, Desired: []string{"6445"}},
+		},
+	}
+	d.Render(true)
+
+	out := buf.String()
+	assert.Contains(t, out, "loadbalancer k3d-test-serverlb would be replaced")
+	assert.Contains(t, out, "+ port 80/tcp->0.0.0.0:8080 (added)")
+	assert.Contains(t, out, "- port 80/tcp->0.0.0.0:10080 (removed)")
+	assert.Contains(t, out, "kube-api host port: [16443] -> [6445]")
+	assert.Contains(t, out, "default kubeconfig would be updated")
+}
+
 func TestDiffClusterSpecClusterLevel(t *testing.T) {
 	actual := &k3d.Cluster{
 		Name:    "test",
@@ -296,6 +462,93 @@ func TestDiffClusterSpecClusterLevel(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, diff.Unsupported)
 		assert.Contains(t, diff.Unsupported[0], "network")
+	})
+
+	t.Run("serverlb port mismatch is actionable, not unsupported", func(t *testing.T) {
+		actualWithLB := &k3d.Cluster{
+			Name:    "test",
+			Network: k3d.ClusterNetwork{Name: "k3d-test"},
+			Nodes: []*k3d.Node{
+				reconstructedServer("k3d-test-server-0", nil, nil, nil, nil),
+				reconstructedLB(nat.PortMap{
+					"80/tcp":   {{HostIP: "0.0.0.0", HostPort: "10080"}},
+					"6443/tcp": {{HostIP: "0.0.0.0", HostPort: "16443"}},
+				}),
+			},
+		}
+		cfg := &conf.ClusterConfig{Cluster: k3d.Cluster{
+			Name:    "test",
+			Network: k3d.ClusterNetwork{Name: "k3d-test"},
+			KubeAPI: exposure("", "16443"),
+			Nodes: []*k3d.Node{
+				targetNode("k3d-test-server-0", k3d.ServerRole, "rancher/k3s:v1.31.0-k3s1", nil, nil, nil, nil),
+				targetLBNode(nat.PortMap{
+					"80/tcp": {{HostIP: "0.0.0.0", HostPort: "8080"}},
+				}, nat.PortBinding{HostPort: "16443"}),
+			},
+		}}
+
+		diff, err := DiffClusterSpec(context.Background(), nil, actualWithLB, cfg)
+		require.NoError(t, err)
+		assert.Empty(t, diff.Unsupported)
+		require.NotNil(t, diff.LoadBalancer)
+		assert.Equal(t, []string{"80/tcp->0.0.0.0:8080"}, diff.LoadBalancer.Added)
+		assert.Equal(t, []string{"80/tcp->0.0.0.0:10080"}, diff.LoadBalancer.Removed)
+	})
+
+	t.Run("stale server api-port labels do not trigger unsupported when the LB has the requested port", func(t *testing.T) {
+		// after an LB-only kube-api port change, the servers' immutable
+		// k3d.server.api.port labels still hold the create-time value; the
+		// LB's actual binding is the ground truth
+		staleServer := reconstructedServer("k3d-test-server-0", nil, nil, nil, nil)
+		staleServer.ServerOpts.KubeAPI = exposure("", "16443")
+		actualWithLB := &k3d.Cluster{
+			Name:    "test",
+			Network: k3d.ClusterNetwork{Name: "k3d-test"},
+			Nodes: []*k3d.Node{
+				staleServer,
+				reconstructedLB(nat.PortMap{
+					"6443/tcp": {{HostIP: "0.0.0.0", HostPort: "6445"}},
+				}),
+			},
+		}
+		cfg := &conf.ClusterConfig{Cluster: k3d.Cluster{
+			Name:    "test",
+			Network: k3d.ClusterNetwork{Name: "k3d-test"},
+			KubeAPI: exposure("", "6445"),
+			Nodes: []*k3d.Node{
+				targetNode("k3d-test-server-0", k3d.ServerRole, "rancher/k3s:v1.31.0-k3s1", nil, nil, nil, nil),
+				targetLBNode(nat.PortMap{}, nat.PortBinding{HostPort: "6445"}),
+			},
+		}}
+
+		diff, err := DiffClusterSpec(context.Background(), nil, actualWithLB, cfg)
+		require.NoError(t, err)
+		assert.Empty(t, diff.Unsupported)
+		assert.Nil(t, diff.LoadBalancer)
+	})
+
+	t.Run("kube-api port change without a loadbalancer stays unsupported", func(t *testing.T) {
+		server := reconstructedServer("k3d-test-server-0", nil, nil, nil, nil)
+		server.ServerOpts.KubeAPI = exposure("", "16443")
+		actualNoLB := &k3d.Cluster{
+			Name:    "test",
+			Network: k3d.ClusterNetwork{Name: "k3d-test"},
+			Nodes:   []*k3d.Node{server},
+		}
+		cfg := &conf.ClusterConfig{Cluster: k3d.Cluster{
+			Name:    "test",
+			Network: k3d.ClusterNetwork{Name: "k3d-test"},
+			KubeAPI: exposure("", "6445"),
+			Nodes: []*k3d.Node{
+				targetNode("k3d-test-server-0", k3d.ServerRole, "rancher/k3s:v1.31.0-k3s1", nil, nil, nil, nil),
+			},
+		}}
+
+		diff, err := DiffClusterSpec(context.Background(), nil, actualNoLB, cfg)
+		require.NoError(t, err)
+		require.Len(t, diff.Unsupported, 1)
+		assert.Contains(t, diff.Unsupported[0], "exposeAPI")
 	})
 
 	t.Run("matching config yields unchanged node and not-diffable notes", func(t *testing.T) {

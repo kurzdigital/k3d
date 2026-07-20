@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/docker/go-connections/nat"
 	dockerunits "github.com/docker/go-units"
 
 	"github.com/k3d-io/k3d/v5/pkg/actions"
@@ -87,6 +88,27 @@ type NodeSpecDiff struct {
 	Changeset *NodeSpecChangeset
 }
 
+// LoadBalancerSpecDiff describes serverlb host-port-mapping differences,
+// including a change of the explicitly requested kube-api host port. It is
+// applied by replacing only the loadbalancer container — no node drain, no
+// etcd rotation (host port bindings live exclusively on the serverlb).
+type LoadBalancerSpecDiff struct {
+	NodeName string
+	// Added / Removed are the host port mappings only present in the config
+	// / only present on the running loadbalancer, rendered as
+	// "port->hostip:hostport" strings (kube-api mapping excluded).
+	Added   []string
+	Removed []string
+	// KubeAPI is the kube-api host port change, if any. Only an explicitly
+	// requested, non-"random" port participates (the host side is
+	// auto-assigned at create time otherwise); the HostIP is not diffed.
+	KubeAPI *FieldDiff
+	// DesiredPorts is the complete desired port set for the replacement
+	// container: the config's port mappings plus the kube-api binding
+	// (resolved against the actual one, see diffLoadBalancerSpec).
+	DesiredPorts nat.PortMap
+}
+
 // ClusterSpecDiff is the result of diffing a desired cluster config against
 // the actual cluster state.
 type ClusterSpecDiff struct {
@@ -95,6 +117,9 @@ type ClusterSpecDiff struct {
 	ChangedNodes []NodeSpecDiff
 	// UnchangedNodes lists node names that already match the desired spec.
 	UnchangedNodes []string
+	// LoadBalancer, if non-nil, describes serverlb port-mapping changes to
+	// be applied by replacing the loadbalancer container.
+	LoadBalancer *LoadBalancerSpecDiff
 	// Unsupported lists definite differences that cannot be applied by
 	// replacing nodes (they require a full cluster recreate). Any entry
 	// here aborts a non-dry-run apply.
@@ -386,6 +411,104 @@ func targetKubeAPIHostPort(target *k3d.Cluster) string {
 	return target.KubeAPI.Binding.HostPort
 }
 
+// nodeAPIPortBinding returns the port-map key and the first host binding of
+// the kube-api port on a node (usually the serverlb). The key is matched on
+// the port number only, because the target side uses the bare "6443" key
+// (LoadbalancerPrepare) while reconstructed nodes carry the
+// runtime-normalized "6443/tcp".
+func nodeAPIPortBinding(node *k3d.Node) (nat.Port, nat.PortBinding, bool) {
+	for port, bindings := range node.Ports {
+		if port.Port() == k3d.DefaultAPIPort && len(bindings) > 0 {
+			return port, bindings[0], true
+		}
+	}
+	return "", nat.PortBinding{}, false
+}
+
+// diffStringSets returns the entries only present in desired (added) and
+// only present in current (removed). Inputs are the sorted-set renderings
+// used for field comparison; outputs keep that order.
+func diffStringSets(current, desired []string) (added, removed []string) {
+	curSet := map[string]struct{}{}
+	for _, s := range current {
+		curSet[s] = struct{}{}
+	}
+	desSet := map[string]struct{}{}
+	for _, s := range desired {
+		desSet[s] = struct{}{}
+	}
+	for _, s := range desired {
+		if _, ok := curSet[s]; !ok {
+			added = append(added, s)
+		}
+	}
+	for _, s := range current {
+		if _, ok := desSet[s]; !ok {
+			removed = append(removed, s)
+		}
+	}
+	return added, removed
+}
+
+// diffLoadBalancerSpec diffs the serverlb's host port mappings (and the
+// explicitly requested kube-api host port) against the desired state and
+// returns the changeset for the loadbalancer replacement, or nil if the
+// loadbalancer already matches.
+//
+// Only the host port bindings are diffed. The proxied-upstream lists inside
+// the LB config are NOT compared: they are rewritten from the config's
+// desired state whenever the loadbalancer is replaced, but pure upstream
+// drift without a port change is not detected (UpdateLoadbalancerConfig
+// regenerates them all-servers anyway after every server replacement).
+func diffLoadBalancerSpec(targetLB, actualLB *k3d.Node, targetKubeAPI *k3d.ExposureOpts) *LoadBalancerSpecDiff {
+	added, removed := diffStringSets(portMapToSortedList(actualLB, true), portMapToSortedList(targetLB, true))
+
+	actualAPIKey, actualAPIBinding, hasActualAPI := nodeAPIPortBinding(actualLB)
+	desiredHP := ""
+	if targetKubeAPI != nil {
+		desiredHP = targetKubeAPI.Binding.HostPort
+	}
+	var kubeAPIDiff *FieldDiff
+	if desiredHP != "" && desiredHP != "random" && hasActualAPI && actualAPIBinding.HostPort != desiredHP {
+		kubeAPIDiff = &FieldDiff{
+			Field:   "kube-api host port",
+			Current: []string{actualAPIBinding.HostPort},
+			Desired: []string{desiredHP},
+		}
+	}
+
+	if len(added) == 0 && len(removed) == 0 && kubeAPIDiff == nil {
+		return nil
+	}
+
+	// Desired port set for the replacement: the config's user port mappings
+	// plus the kube-api binding. The kube-api binding keeps the actual
+	// HostIP (HostIP is not diffed) and, unless explicitly changed, the
+	// actual HostPort (which may have been auto-assigned at create time).
+	desired := nat.PortMap{}
+	for port, bindings := range targetLB.Ports {
+		if port.Port() == k3d.DefaultAPIPort {
+			continue
+		}
+		desired[port] = append([]nat.PortBinding{}, bindings...)
+	}
+	if hasActualAPI {
+		apiBinding := actualAPIBinding
+		if kubeAPIDiff != nil {
+			apiBinding.HostPort = desiredHP
+		}
+		desired[actualAPIKey] = []nat.PortBinding{apiBinding}
+	}
+
+	return &LoadBalancerSpecDiff{
+		NodeName:     actualLB.Name,
+		Added:        added,
+		Removed:      removed,
+		KubeAPI:      kubeAPIDiff,
+		DesiredPorts: desired,
+	}
+}
+
 // DiffClusterSpec diffs a desired cluster config (as produced by the
 // standard config transform pipeline) against the actual cluster state.
 func DiffClusterSpec(ctx context.Context, runtime k3drt.Runtime, actual *k3d.Cluster, clusterConfig *conf.ClusterConfig) (*ClusterSpecDiff, error) {
@@ -455,22 +578,29 @@ func DiffClusterSpec(ctx context.Context, runtime k3drt.Runtime, actual *k3d.Clu
 	if (targetLB == nil) != (actualLB == nil) {
 		diff.Unsupported = append(diff.Unsupported, "loadbalancer: presence differs between config and cluster (requires cluster recreate)")
 	} else if targetLB != nil && actualLB != nil {
-		if !stringSlicesEqual(portMapToSortedList(targetLB, true), portMapToSortedList(actualLB, true)) {
-			diff.Unsupported = append(diff.Unsupported, "ports: cluster-wide serverlb port mappings differ (requires cluster recreate)")
-		}
+		// Port-mapping differences (incl. the kube-api host port) are
+		// applied by replacing only the loadbalancer container.
+		diff.LoadBalancer = diffLoadBalancerSpec(targetLB, actualLB, target.KubeAPI)
 	}
 
-	// Explicitly requested kube-api host port must match the running one.
-	if hp := targetKubeAPIHostPort(target); hp != "" && hp != "random" {
-		actualHP := ""
-		for _, n := range actualWorkers {
-			if n.Role == k3d.ServerRole && n.ServerOpts.KubeAPI != nil {
-				actualHP = n.ServerOpts.KubeAPI.Binding.HostPort
-				break
+	// Without a serverlb, the kube-api host binding is published on the
+	// server container itself; changing it there still requires a recreate.
+	// With a serverlb the binding lives on the LB and is handled above —
+	// deliberately NOT compared against the servers' k3d.server.api.port
+	// labels, which are immutable on running containers and go stale after
+	// an LB-only port change.
+	if actualLB == nil {
+		if hp := targetKubeAPIHostPort(target); hp != "" && hp != "random" {
+			actualHP := ""
+			for _, n := range actualWorkers {
+				if n.Role == k3d.ServerRole && n.ServerOpts.KubeAPI != nil {
+					actualHP = n.ServerOpts.KubeAPI.Binding.HostPort
+					break
+				}
 			}
-		}
-		if actualHP != "" && actualHP != hp {
-			diff.Unsupported = append(diff.Unsupported, fmt.Sprintf("exposeAPI: kube-api host port is %s, config wants %s (requires cluster recreate)", actualHP, hp))
+			if actualHP != "" && actualHP != hp {
+				diff.Unsupported = append(diff.Unsupported, fmt.Sprintf("exposeAPI: kube-api host port is %s, config wants %s (requires cluster recreate)", actualHP, hp))
+			}
 		}
 	}
 
@@ -552,6 +682,18 @@ func (d *ClusterSpecDiff) Render(dryRun bool) {
 			l.Log().Infof("    %-13s %v -> %v", ch.Field+":", ch.Current, ch.Desired)
 		}
 	}
+	if lb := d.LoadBalancer; lb != nil {
+		l.Log().Infof("~ loadbalancer %s %s be replaced:", lb.NodeName, verb)
+		for _, m := range lb.Added {
+			l.Log().Infof("    + port %s (added)", m)
+		}
+		for _, m := range lb.Removed {
+			l.Log().Infof("    - port %s (removed)", m)
+		}
+		if lb.KubeAPI != nil {
+			l.Log().Infof("    ~ %s: %v -> %v (default kubeconfig %s be updated)", lb.KubeAPI.Field, lb.KubeAPI.Current, lb.KubeAPI.Desired, verb)
+		}
+	}
 	for _, name := range d.UnchangedNodes {
 		l.Log().Infof("= %s unchanged", name)
 	}
@@ -570,7 +712,11 @@ func ClusterReconfigureFromConfig(ctx context.Context, runtime k3drt.Runtime, cl
 	diff.Render(dryRun)
 
 	if dryRun {
-		l.Log().Infof("Dry run: %d node(s) would be replaced, %d unchanged, %d unsupported difference(s)", len(diff.ChangedNodes), len(diff.UnchangedNodes), len(diff.Unsupported))
+		lbNote := ""
+		if diff.LoadBalancer != nil {
+			lbNote = ", loadbalancer would be replaced"
+		}
+		l.Log().Infof("Dry run: %d node(s) would be replaced, %d unchanged, %d unsupported difference(s)%s", len(diff.ChangedNodes), len(diff.UnchangedNodes), len(diff.Unsupported), lbNote)
 		return nil
 	}
 
@@ -578,8 +724,22 @@ func ClusterReconfigureFromConfig(ctx context.Context, runtime k3drt.Runtime, cl
 		return fmt.Errorf("config contains %d change(s) that cannot be applied by replacing nodes: %s", len(diff.Unsupported), strings.Join(diff.Unsupported, "; "))
 	}
 
-	if len(diff.ChangedNodes) == 0 {
+	if len(diff.ChangedNodes) == 0 && diff.LoadBalancer == nil {
 		l.Log().Infof("Cluster '%s' already matches the given config — nothing to do", cluster.Name)
+		return nil
+	}
+
+	// Apply the loadbalancer port changes first: a single fast container
+	// replacement that fails early before the (long) node rolls. Order is
+	// otherwise irrelevant — node rolls neither depend on the LB's host
+	// ports nor change the node names its config references.
+	if diff.LoadBalancer != nil {
+		if err := applyLoadBalancerSpec(ctx, runtime, cluster, clusterConfig, diff.LoadBalancer); err != nil {
+			return fmt.Errorf("failed to replace loadbalancer of cluster '%s' with updated port mappings: %w", cluster.Name, err)
+		}
+	}
+
+	if len(diff.ChangedNodes) == 0 {
 		return nil
 	}
 
@@ -605,6 +765,48 @@ func ClusterReconfigureFromConfig(ctx context.Context, runtime k3drt.Runtime, cl
 	}); err != nil {
 		return fmt.Errorf("rolling reconfigure of cluster '%s' failed and is NOT automatically resumable — the cluster may be left with mixed node specs and, in HA, a half-rotated etcd membership (see `k3d cluster reconfigure --help` for recovery): %w", cluster.Name, err)
 	}
+	return nil
+}
+
+// applyLoadBalancerSpec replaces the serverlb container with the desired
+// port set and the transform-produced LB config (which carries the correct
+// proxied-upstream targets from the config's node filters). If the kube-api
+// host port changed, the default kubeconfig is refreshed afterwards so
+// `kubectl` keeps working; externally saved kubeconfig copies are not
+// touched and must be refreshed via `k3d kubeconfig get/merge`.
+func applyLoadBalancerSpec(ctx context.Context, runtime k3drt.Runtime, cluster *k3d.Cluster, clusterConfig *conf.ClusterConfig, lbDiff *LoadBalancerSpecDiff) error {
+	var actualLBNode *k3d.Node
+	for _, n := range cluster.Nodes {
+		if n.Role == k3d.LoadBalancerRole {
+			actualLBNode = n
+			break
+		}
+	}
+	if actualLBNode == nil {
+		return fmt.Errorf("no loadbalancer node found in cluster despite a loadbalancer port diff")
+	}
+
+	if clusterConfig.Cluster.ServerLoadBalancer == nil || clusterConfig.Cluster.ServerLoadBalancer.Config == nil {
+		return fmt.Errorf("desired cluster config carries no loadbalancer config despite a loadbalancer port diff")
+	}
+	desiredConfig := clusterConfig.Cluster.ServerLoadBalancer.Config
+
+	l.Log().Infof("Replacing loadbalancer %s with updated port mappings (%d added, %d removed)...", lbDiff.NodeName, len(lbDiff.Added), len(lbDiff.Removed))
+	if err := replaceLoadbalancer(ctx, runtime, actualLBNode, lbDiff.DesiredPorts, desiredConfig); err != nil {
+		return err
+	}
+
+	if lbDiff.KubeAPI != nil {
+		// The servers' k3d.server.api.port labels still hold the old port
+		// (container labels are immutable); KubeconfigGet reads the actual
+		// LB binding instead, so the refreshed kubeconfig gets the new port.
+		if output, err := KubeconfigGetWrite(ctx, runtime, cluster, "", &WriteKubeConfigOptions{UpdateExisting: true, UpdateCurrentContext: false}); err != nil {
+			l.Log().Warnf("kube-api host port changed, but updating the default kubeconfig failed: %v — run `k3d kubeconfig merge %s -d` manually", err, cluster.Name)
+		} else {
+			l.Log().Infof("Updated kubeconfig '%s' with the new kube-api port %v", output, lbDiff.KubeAPI.Desired)
+		}
+	}
+
 	return nil
 }
 
