@@ -34,15 +34,32 @@ import (
 )
 
 // GetIP checks a given network for a free IP and returns it, if possible
-func GetIP(ctx context.Context, runtime k3drt.Runtime, network *k3d.ClusterNetwork) (netip.Addr, error) {
-	network, err := runtime.GetNetwork(ctx, network)
+func GetIP(ctx context.Context, runtime k3drt.Runtime, searchNet *k3d.ClusterNetwork) (netip.Addr, error) {
+	network, err := runtime.GetNetwork(ctx, searchNet)
 	if err != nil {
-		return netip.Addr{}, fmt.Errorf("runtime failed to get network '%s': %w", network.Name, err)
+		return netip.Addr{}, fmt.Errorf("runtime failed to get network '%s': %w", searchNet.Name, err)
 	}
 
+	ip, err := freeIP(network)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+
+	l.Log().Debugf("Found free IP %s in network %s", ip.String(), network.Name)
+
+	return ip, nil
+}
+
+// freeIP returns the first address of the network's subnet that is neither in use nor part of the
+// runtime's dynamic allocation range, so that a static IP can't be handed out to another container.
+func freeIP(network *k3d.ClusterNetwork) (netip.Addr, error) {
 	var ipsetbuilder netipx.IPSetBuilder
 
 	ipsetbuilder.AddPrefix(network.IPAM.IPPrefix)
+
+	if network.IPAM.IPRange.IsValid() {
+		ipsetbuilder.RemovePrefix(network.IPAM.IPRange)
+	}
 
 	for _, ipused := range network.IPAM.IPsUsed {
 		ipsetbuilder.Remove(ipused)
@@ -57,9 +74,10 @@ func GetIP(ctx context.Context, runtime k3drt.Runtime, network *k3d.ClusterNetwo
 		return netip.Addr{}, err
 	}
 
-	ip := ipset.Ranges()[0].From()
+	ranges := ipset.Ranges()
+	if len(ranges) == 0 {
+		return netip.Addr{}, fmt.Errorf("no free IP left for static assignment in network '%s'", network.Name)
+	}
 
-	l.Log().Debugf("Found free IP %s in network %s", ip.String(), network.Name)
-
-	return ip, nil
+	return ranges[0].From(), nil
 }
