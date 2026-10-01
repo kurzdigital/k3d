@@ -26,7 +26,7 @@ subnet="172.80.0.0/16"
 expectedIPGateway="172.80.0.1" # k3d defaults to subnet_start+1 for the Gateway IP
 expectedIPLabelServer0="172.80.0.3"
 expectedIPServer0="$expectedIPLabelServer0/16" # k3d excludes the subnet_start (x.x.x.0) and then uses IPs in sequential order, but .2 will be used by the tools container that gathers information at start
-expectedIPServerLB="172.80.0.4/16"
+expectedIPRange="172.80.128.0/17" # docker allocates dynamic IPs (e.g. serverlb) from the upper half only, static IPs are taken from the lower half
 
 info "Creating cluster $clustername..."
 $EXE cluster create $clustername --timeout 360s --subnet $subnet || failed "could not create cluster $clustername"
@@ -44,6 +44,13 @@ function check_cluster() {
   fi
   if [[ $(docker network inspect k3d-$clustername | jq ".[0].Containers | .[] | select(.Name == \"k3d-$clustername-server-0\") | .IPv4Address") != "\"$expectedIPServer0\"" ]]; then
     failed "Container k3d-$clustername-server-0's IP does not match expected value"
+  fi
+  if [[ $(docker network inspect k3d-$clustername | jq '.[0].IPAM.Config[0].IPRange') != "\"$expectedIPRange\"" ]]; then
+    failed "IP range does not match expected value: $(docker network inspect k3d-$clustername | jq '.[0].IPAM.Config[0].IPRange') != \"$expectedIPRange\""
+  fi
+  serverlbIP=$(docker network inspect k3d-$clustername | jq -r ".[0].Containers | .[] | select(.Name == \"k3d-$clustername-serverlb\") | .IPv4Address")
+  if [[ ! "$serverlbIP" =~ ^172\.80\.(1(2[89]|[3-9][0-9])|2[0-9][0-9])\. ]]; then
+    failed "Container k3d-$clustername-serverlb's IP $serverlbIP is not within the dynamic IP range $expectedIPRange"
   fi
 
   info "Checking Labels..."

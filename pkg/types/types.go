@@ -215,6 +215,7 @@ type ImageImportOpts struct {
 
 type IPAM struct {
 	IPPrefix netip.Prefix `json:"ipPrefix,omitempty"`
+	IPRange  netip.Prefix `json:"ipRange,omitempty"` // sub-range the runtime uses for dynamic IP allocation (static IPs are picked outside of it)
 	IPsUsed  []netip.Addr `json:"ipsUsed,omitempty"`
 	Managed  bool         // IPAM is done by k3d
 }

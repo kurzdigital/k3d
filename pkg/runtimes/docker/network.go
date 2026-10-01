@@ -29,6 +29,7 @@ import (
 
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
+	"go4.org/netipx"
 
 	l "github.com/k3d-io/k3d/v5/pkg/logger"
 	runtimeErr "github.com/k3d-io/k3d/v5/pkg/runtimes/errors"
@@ -181,13 +182,17 @@ func (d Docker) CreateNetworkIfNotPresent(ctx context.Context, inNet *k3d.Cluste
 		if !inNet.IPAM.IPPrefix.IsValid() {
 			return nil, false, fmt.Errorf("invalid subnet prefix: %s", inNet.IPAM.IPPrefix.String())
 		}
+		ipamConfig := network.IPAMConfig{
+			Subnet:  inNet.IPAM.IPPrefix.String(),
+			Gateway: inNet.IPAM.IPPrefix.Addr().Next().String(), // second IP in subnet will be the Gateway (Next, so we don't hit x.x.x.0)
+		}
+		// restrict docker's dynamic allocation to the upper half of the subnet, so it never hands out
+		// a static IP that k3d assigned to a node (e.g. when the daemon restarts all containers in parallel)
+		if ipRange, ok := dynamicIPRange(inNet.IPAM.IPPrefix); ok {
+			ipamConfig.IPRange = ipRange.String()
+		}
 		netCreateOpts.IPAM = &network.IPAM{
-			Config: []network.IPAMConfig{
-				{
-					Subnet:  inNet.IPAM.IPPrefix.String(),
-					Gateway: inNet.IPAM.IPPrefix.Addr().Next().String(), // second IP in subnet will be the Gateway (Next, so we don't hit x.x.x.0)
-				},
-			},
+			Config: []network.IPAMConfig{ipamConfig},
 		}
 	}
 
@@ -202,12 +207,12 @@ func (d Docker) CreateNetworkIfNotPresent(ctx context.Context, inNet *k3d.Cluste
 	}
 
 	l.Log().Infof("Created network '%s'", inNet.Name)
-	prefix, err := netip.ParsePrefix(networkDetails.IPAM.Config[0].Subnet)
+	ipam, err := d.parseIPAM(networkDetails.IPAM.Config[0])
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to parse IP Prefix of newly created network '%s': %w", newNet.ID, err)
+		return nil, false, fmt.Errorf("failed to parse IPAM config of newly created network '%s': %w", newNet.ID, err)
 	}
 
-	newClusterNet := &k3d.ClusterNetwork{Name: inNet.Name, ID: networkDetails.ID, IPAM: k3d.IPAM{IPPrefix: prefix}}
+	newClusterNet := &k3d.ClusterNetwork{Name: inNet.Name, ID: networkDetails.ID, IPAM: k3d.IPAM{IPPrefix: ipam.IPPrefix, IPRange: ipam.IPRange}}
 
 	if inNet.IPAM.IPPrefix != (netip.Prefix{}) {
 		newClusterNet.IPAM.Managed = true
@@ -362,6 +367,13 @@ func (d Docker) parseIPAM(config network.IPAMConfig) (ipam k3d.IPAM, err error) 
 		return
 	}
 
+	if config.IPRange != "" {
+		ipam.IPRange, err = netip.ParsePrefix(config.IPRange)
+		if err != nil {
+			return
+		}
+	}
+
 	if config.Gateway == "" {
 		gateway = ipam.IPPrefix.Addr().Next()
 	} else {
@@ -370,6 +382,19 @@ func (d Docker) parseIPAM(config network.IPAMConfig) (ipam k3d.IPAM, err error) 
 	ipam.IPsUsed = append(ipam.IPsUsed, gateway)
 
 	return
+}
+
+// dynamicIPRange returns the upper half of the given subnet, which is used as the range for the runtime's dynamic
+// IP allocation. The lower half (incl. the gateway) is left for static IPs assigned by k3d.
+// Subnets too small to be split sensibly (smaller than /29 for IPv4) don't get a range.
+func dynamicIPRange(subnet netip.Prefix) (netip.Prefix, bool) {
+	subnet = subnet.Masked()
+	if !subnet.IsValid() || subnet.Addr().BitLen()-subnet.Bits() < 3 {
+		return netip.Prefix{}, false
+	}
+	lowerHalf := netip.PrefixFrom(subnet.Addr(), subnet.Bits()+1)
+	upperStart := netipx.PrefixLastIP(lowerHalf).Next()
+	return netip.PrefixFrom(upperStart, subnet.Bits()+1), true
 }
 
 // parseIPAddress Returns an netip.Addr by either receiving the IP address or IP CIDR notation. If the value

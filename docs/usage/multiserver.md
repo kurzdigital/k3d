@@ -20,6 +20,10 @@ k3d cluster create multiserver --servers 3
     To enable this, create the cluster with the `--subnet auto` or `--subnet 172.45.0.0/16` 
     (or whatever subnet you need) flags. With `--subnet auto`, k3d will create a fake docker network 
     to get an available subnet.
+    k3d restricts Docker's dynamic IP allocation for that network to the upper half of the subnet (`--ip-range`)
+    and assigns static IPs from the lower half, so containers started dynamically (agents, loadbalancer, other
+    containers in the network) can't take a server's IP while it is stopped. Networks created by older k3d
+    versions don't have this range.
     
     See the relavent issue [#550](https://github.com/k3d-io/k3d/issues/550) for more details.
 
